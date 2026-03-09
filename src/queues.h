@@ -31,10 +31,6 @@
 #ifndef __cplusplus
 #include <stdatomic.h>
 #include "serverassert.h"
-typedef _Atomic(void *) atomic_void_ptr;
-#else
-typedef void *atomic_void_ptr;
-typedef size_t atomic_size_t;
 #endif
 
 /* ==========================================================================
@@ -62,7 +58,7 @@ typedef struct mpscQueue {
     atomic_size_t head_cache;
 
     /* Data buffer */
-    _Alignas(CACHE_LINE_SIZE) atomic_void_ptr *buffer;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(void *) *buffer;
 } mpscQueue;
 
 extern void mpscInit(mpscQueue *q);
