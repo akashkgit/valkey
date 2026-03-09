@@ -21,6 +21,7 @@ static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0}; /* dedicated per-th
 static size_t io_jobs_submitted;
 static atomic_size_t io_jobs_finished;
 static int io_threads_initialized = 0;
+_Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
 /* Job Types for Tagged Pointers
  * We use the lower 3 bits of the pointer to store the job type.
@@ -297,16 +298,21 @@ static void *IOThreadMain(void *myid) {
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
-
     const int BATCH_SIZE = 32;
     void *batch_jobs[BATCH_SIZE];
-
+    int processed = 0;
+    monotime work_start_time = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
-        int processed = 0;
         size_t batch_count = 0;
-
+        monotime prev_work_start_time = work_start_time;
+        work_start_time = getMonotonicUs();
+        if (processed != 0) {
+            atomic_fetch_add_explicit(&used_active_time_io_thread[id],
+                                        work_start_time - prev_work_start_time,
+                                        memory_order_relaxed);
+        }
         /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
         while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
             for (size_t i = 0; i < batch_count; i++) {
@@ -346,7 +352,7 @@ static void *IOThreadMain(void *myid) {
                 ioThreadWriteToClient(data);
                 break;
             case JOB_REQ_FREE_OBJ:
-                decrRefCount(data);
+                sdsfreeVoid(data);
                 break;
             case JOB_REQ_ACCEPT:
                 ioThreadAccept(data);
@@ -367,6 +373,7 @@ static void *IOThreadMain(void *myid) {
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
+                //ak-todo: check if flushing needs to be included
                 flushPendingIOResponses(0);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
@@ -377,6 +384,10 @@ static void *IOThreadMain(void *myid) {
     }
     pthread_cleanup_pop(0);
     return NULL;
+}
+
+long long getIOThreadActiveTimeMicroseconds(int id) {
+    return atomic_load_explicit(&used_active_time_io_thread[id], memory_order_relaxed);
 }
 
 static void createIOThread(int id) {
@@ -684,8 +695,10 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
 
-    void *job = pack_job(obj, JOB_REQ_FREE_OBJ);
+    void *job = pack_job(objectGetVal(obj), JOB_REQ_FREE_OBJ);
     if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) return C_ERR;
+    objectSetVal(obj, NULL);
+    decrRefCount(obj);
     io_jobs_submitted++;
     server.stat_io_freed_objects++;
     return C_OK;
@@ -836,6 +849,8 @@ static void handleReadJobs(client **read_jobs, int read_count) {
     if (read_count) {
         server.stat_io_reads_processed += read_count;
         processClientsCommandsBatch();
+        /* Any responses that failed to enqueue to IO threads need to be handled now */
+        handleClientsWithPendingWrites();
     }
 }
 
