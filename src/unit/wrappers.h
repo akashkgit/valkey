@@ -37,7 +37,8 @@ extern "C" {
 // Some C keywords or built-in types (e.g., _Atomic, _Bool) are not
 // recognized or have different meanings in C++. To allow C headers
 // to be included in C++ code without errors, we redefine them appropriately.
-#define _Atomic                         /* _Atomic is not a C++ keyword; define empty */
+
+#define _Atomic(type) alignas(sizeof(type)) type /* Preserve alignment in C++ builds */
 #define atomic_size_t unsigned long int /* atomic_size_t is not a C++ keyword; remove atomic */
 #define _Alignas alignas                /* Replace C _Alignas with C++ alignas */
 #define _Bool bool                      /* Replace C _Bool with C++ bool */
