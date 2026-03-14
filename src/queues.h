@@ -31,10 +31,6 @@
 #ifndef __cplusplus
 #include <stdatomic.h>
 #include "serverassert.h"
-typedef _Atomic(void *) atomic_void_ptr;
-#else
-typedef void *atomic_void_ptr;
-typedef size_t atomic_size_t;
 #endif
 
 /* ==========================================================================
@@ -54,15 +50,15 @@ typedef struct mpscTicket {
 
 typedef struct mpscQueue {
     /* Consumer cache line */
-    _Alignas(CACHE_LINE_SIZE) atomic_size_t head;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) head;
     size_t tail_cache;
 
     /* Producer cache line */
-    _Alignas(CACHE_LINE_SIZE) atomic_size_t tail;
-    atomic_size_t head_cache;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) tail;
+    _Atomic(size_t) head_cache;
 
     /* Data buffer */
-    _Alignas(CACHE_LINE_SIZE) atomic_void_ptr *buffer;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(void *) *buffer;
 } mpscQueue;
 
 extern void mpscInit(mpscQueue *q);
@@ -88,13 +84,13 @@ static_assert((SPMC_QUEUE_SIZE & (SPMC_QUEUE_SIZE - 1)) == 0, "SPMC_QUEUE_SIZE m
 #endif
 
 typedef struct spmcCell {
-    _Alignas(CACHE_LINE_SIZE) atomic_size_t sequence;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) sequence;
     void *data;
 } spmcCell;
 
 typedef struct spmcQueue {
     /* Shared Read/Write (High Contention) */
-    _Alignas(CACHE_LINE_SIZE) atomic_size_t head;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) head;
 
     /* Producer Cache line */
     _Alignas(CACHE_LINE_SIZE) size_t tail;
@@ -123,11 +119,11 @@ static_assert((SPSC_QUEUE_SIZE & (SPSC_QUEUE_SIZE - 1)) == 0, "SPSC_QUEUE_SIZE m
 
 typedef struct spscQueue {
     /* Consumer cache line */
-    _Alignas(CACHE_LINE_SIZE) atomic_size_t head;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) head;
     size_t tail_cache;
 
     /* Producer cache line */
-    _Alignas(CACHE_LINE_SIZE) atomic_size_t tail;
+    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) tail;
     size_t tail_local; /* Private write index */
     size_t head_cache;
 
