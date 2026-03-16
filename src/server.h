@@ -238,6 +238,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define COMMAND_SET 1
 #define COMMAND_HGET 2
 #define COMMAND_HSET 3
+#define COMMAND_MSET 4
 
 /* Command flags. Please check the definition of struct serverCommand in this file
  * for more information about the meaning of every flag. */
@@ -2266,6 +2267,7 @@ struct valkeyServer {
     int cluster_port;                                      /* Set the cluster port for a node. */
     mstime_t cluster_node_timeout;                         /* Cluster node timeout. */
     mstime_t cluster_ping_interval;                        /* A debug configuration for setting how often cluster nodes send ping messages. */
+    int cluster_message_gossip_perc;                       /* A configuration for setting the percentage of peer nodes to be gossiped in ping/pong messages. */
     char *cluster_configfile;                              /* Cluster auto-generated config file name. */
     struct clusterState *cluster;                          /* State of the cluster */
     int cluster_migration_barrier;                         /* Cluster replicas migration barrier. */
@@ -3024,7 +3026,7 @@ void processClientIOWriteDone(client *c);
 void releaseReplyReferences(client *c);
 void resetLastWrittenBuf(client *c);
 
-int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int max_args);
+int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_idx, int max_args, int *flags, int *unit, int *expire_idx, robj **expire, robj **compare_val);
 
 /* logreqres.c - logging of requests and responses */
 void reqresReset(client *c, int free_buf);
@@ -3163,7 +3165,7 @@ void objectSetVal(robj *o, void *val);
 void objectUnembedVal(robj *o);
 void *objectGetVal(const robj *o);
 sds objectGetKey(const robj *o);
-long long objectGetExpire(const robj *o);
+mstime_t objectGetExpire(const robj *o);
 uint8_t objectGetLFUFrequency(robj *o);
 uint32_t objectGetLRUIdleSecs(robj *o);
 uint32_t objectGetIdleness(robj *o);
@@ -3260,6 +3262,7 @@ int rewriteAppendOnlyFileBackground(void);
 int loadAppendOnlyFiles(aofManifest *am);
 void stopAppendOnly(void);
 int startAppendOnly(void);
+int restartAOFWithSyncRdb(void);
 void backgroundRewriteDoneHandler(int exitcode, int bysignal);
 void killAppendOnlyChild(void);
 void restartAOFAfterSYNC(void);
@@ -3570,7 +3573,7 @@ char *hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what, size_t *len);
 sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what);
 robj *hashTypeLookupWriteOrCreate(client *c, robj *key);
 robj *hashTypeGetValueObject(robj *o, sds field);
-int hashTypeSet(robj *o, sds field, sds value, long long expiry, int flags, bool *expired_overwritten);
+int hashTypeSet(robj *o, sds field, sds value, mstime_t expiry, int flags, bool *expired_overwritten);
 robj *hashTypeDup(robj *o);
 bool hashTypeHasVolatileFields(robj *o);
 int hashTypeUpdateAsStringRef(robj *o, sds field, const char *buf, size_t len);
@@ -3617,10 +3620,11 @@ sds keyspaceEventsFlagsToString(int flags);
                                          * to apply the configuration change even if the new config value is the same as    \
                                          * the old. */
 
-#define INTEGER_CONFIG 0        /* No flags means a simple integer configuration */
-#define MEMORY_CONFIG (1 << 0)  /* Indicates if this value can be loaded as a memory value */
-#define PERCENT_CONFIG (1 << 1) /* Indicates if this value can be loaded as a percent (and stored as a negative int) */
-#define OCTAL_CONFIG (1 << 2)   /* This value uses octal representation */
+#define INTEGER_CONFIG 0         /* No flags means a simple integer configuration */
+#define MEMORY_CONFIG (1 << 0)   /* Indicates if this value can be loaded as a memory value */
+#define PERCENT_CONFIG (1 << 1)  /* Indicates if this value can be loaded as a percent (and stored as a negative int) */
+#define OCTAL_CONFIG (1 << 2)    /* This value uses octal representation */
+#define UNSIGNED_CONFIG (1 << 3) /* This value uses unsigned representation */
 
 /* Enum Configs contain an array of configEnum objects that match a string with an integer. */
 typedef struct configEnum {
@@ -3673,6 +3677,14 @@ void addModuleNumericConfig(const char *module_name,
                             int conf_flags,
                             long long lower,
                             long long upper);
+void addModuleUnsignedNumericConfig(const char *module_name,
+                                    const char *name,
+                                    int flags,
+                                    void *privdata,
+                                    unsigned long long default_val,
+                                    int conf_flags,
+                                    unsigned long long lower,
+                                    unsigned long long upper);
 void addModuleConfigApply(list *module_configs, ModuleConfig *module_config);
 int moduleConfigApplyConfig(list *module_configs, const char **err, const char **err_arg_name);
 int getModuleBoolConfig(ModuleConfig *module_config);
@@ -3683,6 +3695,8 @@ int getModuleEnumConfig(ModuleConfig *module_config);
 int setModuleEnumConfig(ModuleConfig *config, int val, const char **err);
 long long getModuleNumericConfig(ModuleConfig *module_config);
 int setModuleNumericConfig(ModuleConfig *config, long long val, const char **err);
+unsigned long long getModuleUnsignedNumericConfig(ModuleConfig *module_config);
+int setModuleUnsignedNumericConfig(ModuleConfig *config, unsigned long long val, const char **err);
 
 /* db.c -- Keyspace access API */
 int removeExpire(serverDb *db, robj *key);
@@ -3695,7 +3709,7 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
 int keyIsExpired(serverDb *db, robj *key);
 long long getExpire(serverDb *db, robj *key);
 robj *setExpire(client *c, serverDb *db, robj *key, long long when);
-int checkAlreadyExpired(long long when);
+int checkAlreadyExpired(mstime_t when);
 robj *lookupKeyRead(serverDb *db, robj *key);
 robj *lookupKeyWrite(serverDb *db, robj *key);
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
@@ -3744,7 +3758,7 @@ void discardTempDb(serverDb **tempDb);
 int selectDb(client *c, int id);
 void signalModifiedKey(client *c, serverDb *db, robj *key);
 void signalFlushedDb(int dbid, int async);
-void scanGenericCommand(client *c, robj *o, unsigned long long cursor);
+void scanGenericCommand(client *c, robj *o, unsigned long long cursor, int slot, sds cursor_prefix, sds finished_cursor_prefix);
 int parseScanCursorOrReply(client *c, sds buf, unsigned long long *cursor);
 int dbAsyncDelete(serverDb *db, robj *key);
 void emptyDbAsync(serverDb *db);
@@ -3998,6 +4012,7 @@ void roleCommand(client *c);
 void debugCommand(client *c);
 void msetCommand(client *c);
 void msetnxCommand(client *c);
+void msetexCommand(client *c);
 void zaddCommand(client *c);
 void zincrbyCommand(client *c);
 void zrangeCommand(client *c);
@@ -4090,6 +4105,7 @@ void clusterCommand(client *c);
 void clusterKeySlotCommand(client *c);
 void clusterFlushslotCommand(client *c);
 void clusterSlotStatsCommand(client *c);
+void clusterscanCommand(client *c);
 void restoreCommand(client *c);
 void migrateCommand(client *c);
 void askingCommand(client *c);
