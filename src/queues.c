@@ -103,8 +103,8 @@ size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs) {
  * SPMC QUEUE (Single-Producer Multi-Consumer)
  * ========================================================================== */
 
-void spmcInit(spmcQueue *q) {
-    q->buffer = (spmcCell *)zmalloc(sizeof(spmcCell) * SPMC_QUEUE_SIZE);
+inline void spmcInit(spmcQueue *q) {
+    q->buffer = (spmcCell *)zmalloc_cache_aligned(sizeof(spmcCell) * SPMC_QUEUE_SIZE);
     atomic_init(&q->head, 0);
     q->tail = 0;
     q->head_cache = 0;
