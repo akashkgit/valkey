@@ -14,6 +14,10 @@ extern "C" {
 #include "queues.h"
 }
 
+#define SPSC_QUEUE_SIZE 4096
+#define SPMC_QUEUE_SIZE 4096
+#define MPSC_QUEUE_SIZE 16384
+
 #define STRESS_ITERATIONS 100000
 #define NUM_THREADS 4
 
@@ -29,7 +33,7 @@ class SpscQueueTest : public ::testing::Test {
     };
 
     void SetUp() override {
-        spscInit(&q);
+        spscInit(&q, SPSC_QUEUE_SIZE);
     }
 
     void TearDown() override {
@@ -147,7 +151,7 @@ class SpmcQueueTest : public ::testing::Test {
     };
 
     void SetUp() override {
-        spmcInit(&q);
+        spmcInit(&q, SPMC_QUEUE_SIZE);
         ASSERT_NE(q.buffer, nullptr);
         EXPECT_EQ(reinterpret_cast<uintptr_t>(q.buffer) % CACHE_LINE_SIZE, 0u);
     }
@@ -259,7 +263,7 @@ class MpscQueueTest : public ::testing::Test {
     };
 
     void SetUp() override {
-        mpscInit(&q);
+        mpscInit(&q, MPSC_QUEUE_SIZE);
     }
 
     void TearDown() override {

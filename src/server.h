@@ -1846,6 +1846,9 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
+    int io_threads_spmc_size;                 /* SPMC queue size for IO threads. */
+    int io_threads_spsc_size;                 /* SPSC queue size for IO threads. */
+    int io_threads_mpsc_size;                 /* MPSC queue size for IO threads. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
