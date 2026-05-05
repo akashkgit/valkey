@@ -14,10 +14,6 @@ extern "C" {
 #include "queues.h"
 }
 
-#define SPSC_QUEUE_SIZE 4096
-#define SPMC_QUEUE_SIZE 4096
-#define MPSC_QUEUE_SIZE 16384
-
 #define STRESS_ITERATIONS 100000
 #define NUM_THREADS 4
 
@@ -26,6 +22,7 @@ extern "C" {
 class SpscQueueTest : public ::testing::Test {
   protected:
     spscQueue q;
+    static constexpr size_t SPSC_QUEUE_SIZE = 4096;
 
     struct ConsumerArg {
         spscQueue *q;
@@ -143,6 +140,7 @@ TEST_F(SpscQueueTest, TestSpscConcurrent) {
 class SpmcQueueTest : public ::testing::Test {
   protected:
     spmcQueue q;
+    static constexpr size_t SPMC_QUEUE_SIZE = 4096;
 
     struct ConsumerArg {
         spmcQueue *q;
@@ -255,6 +253,7 @@ TEST_F(SpmcQueueTest, TestSpmcConcurrent) {
 class MpscQueueTest : public ::testing::Test {
   protected:
     mpscQueue q;
+    static constexpr size_t MPSC_QUEUE_SIZE = 16384;
 
     struct ProducerArg {
         mpscQueue *q;

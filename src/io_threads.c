@@ -381,7 +381,7 @@ static void createIOThread(int id) {
     serverAssert(id > 0 && id < server.io_threads_num);
 
     /* Initialize the private SPSC queue for this thread */
-    spscInit(&io_private_inbox[id], server.io_threads_spsc_size);
+    spscInit(&io_private_inbox[id], IO_SPSC_QUEUE_SIZE);
 
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
@@ -441,7 +441,7 @@ int updateIOThreads(const char **err) {
      * in that state, we will deadlock (Main thread waits for worker, Worker waits for queue space). */
     size_t pending = getPendingIOResponsesCount();
 
-    if (pending > server.io_threads_mpsc_size) {
+    if (pending > io_shared_outbox.queue_size) {
         if (err) *err = "Can't update IO threads under load, try again later";
         return 0;
     }
@@ -480,8 +480,8 @@ void initIOThreads(int prev_threads_num) {
         server.active_io_threads_num = 1; /* We start with threads not active. */
         server.io_poll_state = AE_IO_STATE_NONE;
         server.io_ae_fired_events = 0;
-        spmcInit(&io_shared_inbox, server.io_threads_spmc_size);
-        mpscInit(&io_shared_outbox, server.io_threads_mpsc_size);
+        spmcInit(&io_shared_inbox, IO_SPMC_QUEUE_SIZE);
+        mpscInit(&io_shared_outbox, IO_MPSC_QUEUE_SIZE);
         io_jobs_submitted = 0;
         atomic_init(&io_jobs_finished, 0);
         prefetchCommandsBatchInit();
