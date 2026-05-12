@@ -565,6 +565,31 @@ static void rehashEntry(hashtable *ht, void *entry, uint64_t hash, uint8_t h2) {
     ht->used[1]++;
 }
 
+/* Release memory pages of rehashed buckets back to the OS incrementally.
+ * This function is called after each bucket is rehashed. When an entire range
+ * worth of buckets has been processed, it advises the OS that the pages
+ * are no longer needed (MADV_DONTNEED). This spreads the memory release over
+ * the entire rehashing process, avoiding a latency spike that would occur if
+ * we released all the old table's memory at once when rehashing completes. */
+static void dismissRehashedBucketsIfNeeded(hashtable *ht) {
+    static size_t page_size = 0;
+    if (page_size == 0) page_size = sysconf(_SC_PAGESIZE);
+
+    size_t buckets_per_page = page_size / sizeof(bucket);
+    const size_t pages_per_dismiss = 16;
+    size_t buckets_per_dismiss = buckets_per_page * pages_per_dismiss;
+    if (ht->rehash_idx % buckets_per_dismiss != 0) {
+        return;
+    }
+
+    bucket *ptr = ht->tables[0] + ht->rehash_idx - buckets_per_dismiss;
+    ptr = (bucket *)((size_t)ptr & ~(page_size - 1));
+    if (ptr < ht->tables[0]) {
+        return;
+    }
+    zmadvise_dontneed_range(ptr, pages_per_dismiss * page_size);
+}
+
 /* After migrating entries in a bucket chain from the old table
  * to the new one, this function should be called immediately to
  * handle the cleanup of old buckets, such as clearing presence bits. */
@@ -587,6 +612,9 @@ static void rehashStepFinalize(hashtable *ht) {
 
     /* Advance to the next bucket. */
     ht->rehash_idx++;
+
+    /* Release page back to OS incrementally. */
+    dismissRehashedBucketsIfNeeded(ht);
 
     /* Check if we already rehashed the whole table. */
     if (ht->used[0] == 0 && ht->child_buckets[0] == 0) {
@@ -1568,7 +1596,7 @@ hashtable *hashtableDefragTables(hashtable *ht, void *(*defragfn)(void *)) {
  * forked and memory won't be used again. See zmadvise_dontneed() */
 void dismissHashtable(hashtable *ht) {
     for (int i = 0; i < 2; i++) {
-        zmadvise_dontneed(ht->tables[i], numBuckets(ht->bucket_exp[i]) * sizeof(bucket *));
+        zmadvise_dontneed(ht->tables[i], numBuckets(ht->bucket_exp[i]) * sizeof(bucket));
     }
 }
 
@@ -2320,6 +2348,11 @@ bool hashtableNext(hashtableIterator *iterator, void **elemptr) {
         }
         return true;
     }
+    /* Clean up eagerly so repeated hashtableNext calls return false and
+     * safe iterators don't keep rehashing paused. The caller's own
+     * hashtableCleanupIterator call becomes a no-op (hashtable == NULL). */
+    hashtableCleanupIterator(iterator);
+    iter->hashtable = NULL;
     return false;
 }
 
