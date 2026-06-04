@@ -144,6 +144,8 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c);
 int postponeClientRead(client *c);
 char *getClientSockname(client *c);
 static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter);
+static inline void deferPipelineClient(client *c);
+static inline void removePipelineDeferralClient(client *c);
 static int clientMatchesFilter(client *client, clientFilter *client_filter);
 static int validateClientFlagFilter(sds flag_filter);
 static int validateClientCapaFilter(sds capa);
@@ -2285,6 +2287,12 @@ void unlinkClient(client *c) {
         c->flag.unblocked = 0;
     }
 
+    /* Remove the client from the queue of deferred pipeline clients, if present.
+     * Without this, a client freed while deferred would leave a dangling list node
+     * in server.pipeline_deferral.queue, leading to a use-after-free when the
+     * pipeline timer later dequeues it. */
+    removePipelineDeferralClient(c);
+
     /* Clear the tracking status. */
     if (c->flag.tracking) disableTracking(c);
 
@@ -2507,7 +2515,6 @@ void freeClientOrCloseLater(client *c, int async) {
         }
     }
 }
-
 
 /* Log errors for invalid use and free the client in async way.
  * We will add additional information about the client to the message. */
@@ -4659,6 +4666,7 @@ static void prefetchCommandQueueKeys(client *c) {
 }
 
 int processInputBuffer(client *c) {
+    monotime startTime = getMonotonicUs(); // AMZN
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
@@ -4669,6 +4677,14 @@ int processInputBuffer(client *c) {
         c->read_flags = isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
 
+        /* BEGIN AMZN */
+        if (!c->flag.replica && !c->flag.primary) {
+            if ((server.pipeline_deferral.execution_limit_ms > 0 && elapsedMs(startTime) >= server.pipeline_deferral.execution_limit_ms) || (server.pipeline_deferral.cob_limit_bytes > 0 && getClientOutputBufferMemoryUsage(c) > server.pipeline_deferral.cob_limit_bytes)) {
+                deferPipelineClient(c);
+                break;
+            }
+        }
+        /* END AMZN */
         bool popped_from_queue;
         /* If commands are queued up, pop from the queue first */
         if (!consumeCommandQueue(c)) {
@@ -7184,6 +7200,73 @@ void evictClients(void) {
     }
 }
 
+/* Pipeline timer event handler.
+ * Remove one client from the head of the queue of deferred clients and resume processing its
+ * input buffer. Note that we process one client per timer invocation so as to keep the event
+ * loop spinning faster, thus improving the server's responsiveness and average latency.
+ */
+static long long deferredPipelineTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    UNUSED(eventLoop);
+    UNUSED(id);
+    UNUSED(clientData);
+
+    if (listLength(server.pipeline_deferral.queue) == 0) {
+        server.pipeline_deferral.timer_proc_active = false;
+        return AE_NOMORE; // turn off the timer event
+    }
+
+    // Dequeue a client from the deferred pipeline queue
+    list *queue = server.pipeline_deferral.queue;
+    listNode *ln = listFirst(queue);
+    client *c = listNodeValue(ln);
+    removePipelineDeferralClient(c);
+
+    // Process the remaining commands in the query buffer.
+    if (processInputBuffer(c) == C_ERR || c->flag.close_asap) return 0;
+
+    beforeNextClient(c);
+
+    // Re-register fd with the event loop for reading unless the client is blocked or deferred again.
+    if (IS_AMZ_CLIENT_BLOCKED(c)) return 0;
+
+    if (c->conn && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+        freeClient(c);
+    }
+
+    return 0; // continue processing remaining deferred clients
+}
+
+/* When a slow-running pipelined command is detected, we call this function to defer processing
+ * of the remaining commands. First, push the client into a queue. Then, unregister it from the
+ * event loop for reading. Finally, create a timer event (if not created yet) that will continue
+ * to process the client later. */
+static inline void deferPipelineClient(client *c) {
+    serverAssert(!c->flag.deferred);
+
+    // enqueue: add to the tail
+    list *queue = server.pipeline_deferral.queue;
+    listAddNodeTail(queue, c);
+    c->flag.deferred = 1;
+    c->pipeline_deferral_node = listLast(queue);
+    server.pipeline_deferral.total_deferrals++; // total_deferrals is never decremented
+
+    // Unregister fd from the event loop for reading. Without doing so, file events may be fired again
+    // to fetch next 16KB of query, while we are not done with processing the current query buffer.
+    connSetReadHandler(c->conn, NULL);
+
+    if (!server.pipeline_deferral.timer_proc_active) {
+        server.pipeline_deferral.timer_proc_active = true;
+        aeCreateTimeEvent(server.el, 0, deferredPipelineTimeProc, NULL, NULL);
+    }
+}
+
+static inline void removePipelineDeferralClient(client *c) {
+    if (!c->flag.deferred) return;
+
+    listDelNode(server.pipeline_deferral.queue, c->pipeline_deferral_node);
+    c->flag.deferred = 0;
+    c->pipeline_deferral_node = NULL;
+}
 /* IO threads functions */
 
 void ioThreadReadQueryFromClient(client *c) {

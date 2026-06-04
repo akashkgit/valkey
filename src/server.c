@@ -2536,6 +2536,12 @@ void initServerConfig(void) {
     /* Client output buffer limits */
     for (j = 0; j < CLIENT_TYPE_OBUF_COUNT; j++) server.client_obuf_limits[j] = clientBufferLimitsDefaults[j];
 
+    // Initialize pipeline deferral queue
+    server.pipeline_deferral.queue = listCreate();
+    // Initialize pipeline deferral metric
+    server.pipeline_deferral.total_deferrals = 0;
+
+
     /* Linux OOM Score config */
     for (j = 0; j < CONFIG_OOM_COUNT; j++) server.oom_score_adj_values[j] = configOOMScoreAdjValuesDefaults[j];
 
@@ -6917,7 +6923,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "instantaneous_eventloop_duration_usec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_DURATION),
                 "eventloop_priority_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].cnt,
                 "eventloop_priority_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
-                "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
+                "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum, 
+                "amz_current_num_pipeline_deferral_clients:%lu\r\n", listLength(server.pipeline_deferral.queue),
+                "amz_total_pipeline_deferral_lifetime:%llu\r\n", server.pipeline_deferral.total_deferrals));
         info = genValkeyInfoStringACLStats(info);
     }
 
@@ -7637,8 +7645,8 @@ void dismissMemoryInChild(void) {
     /* madvise(MADV_DONTNEED) may not work if Transparent Huge Pages is enabled. */
     if (server.thp_enabled) return;
 
-        /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
-         * so we avoid these pointless loops when they're not going to do anything. */
+    /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
+     * so we avoid these pointless loops when they're not going to do anything. */
 #if defined(USE_JEMALLOC) && defined(__linux__)
     listIter li;
     listNode *ln;
@@ -8415,5 +8423,4 @@ int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_
     }
     return C_OK;
 }
-
 /* The End */
