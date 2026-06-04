@@ -1276,6 +1276,7 @@ typedef struct ClientFlags {
     uint64_t throttled : 1;                /* Currently queued in a throttler */
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
+    uint64_t pipeline_deferred : 1;        /* Deferred after exceeding the cumulative pipeline execution-time limit */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1492,6 +1493,7 @@ typedef struct client {
     size_t last_memory_usage;
     /* Fields after this point are less frequently used */
     listNode *client_list_node;        /* list node in client list */
+    listNode *deferred_pipeline_node;  /* Stores reference to the list node in the deferred pipeline queue for the current client */
     mstime_t buf_peak_last_reset_time; /* keeps the last time the buffer peak value was reset */
     size_t querybuf_peak;              /* Recent (100ms or more) peak of querybuf size. */
     dictEntry *cur_script;             /* Cached pointer to the dictEntry of the script being executed. */
@@ -1950,6 +1952,7 @@ struct valkeyServer {
     rax *clients_index;         /* Active clients dictionary by client ID. */
     uint32_t paused_actions;    /* Bitmask of actions that are currently paused */
     list *postponed_clients;    /* List of postponed clients */
+    list *deferred_pipeline_clients; /* List of clients with deferred pipelines */
     pause_event client_pause_per_purpose[NUM_PAUSE_PURPOSES];
     char neterr[ANET_ERR_LEN];                /* Error buffer for anet.c */
     dict *migrate_cached_sockets;             /* MIGRATE cached sockets */
@@ -2013,6 +2016,7 @@ struct valkeyServer {
     long long stat_rejected_conn;                  /* Clients rejected because of maxclients */
     long long stat_rejected_priority_conn;         /* Prioritized clients rejected because of maxclients */
     long long stat_num_active_priority_clients;    /* Number of active prioritized clients */
+    long long stat_total_deferred_pipeline_clients; /* Total number of pipeline deferral events */
     long long stat_sync_full;                      /* Number of full resyncs with replicas. */
     long long stat_sync_partial_ok;                /* Number of accepted PSYNC requests. */
     long long stat_sync_partial_err;               /* Number of unaccepted PSYNC requests. */
@@ -2106,6 +2110,7 @@ struct valkeyServer {
     unsigned long active_defrag_max_scan_fields; /* maximum number of fields of set/hash/zset/list to process from
                                                     within the main dict scan */
     size_t client_max_querybuf_len;              /* Limit for client query buffer length */
+    unsigned int pipeline_cmds_time_limit_ms;    /* Cumulative execution-time limit for a client's pipelined commands per cycle */
     int config_databases;                        /* Total number of configured DBs in standalone */
     int config_databases_cluster;                /* Total number of configured DBs in cluster mode */
     int dbnum;                                   /* Total number of initialized DBs */
