@@ -139,6 +139,8 @@ struct ValkeyModule;
 #define CONFIG_DEFAULT_HZ 10 /* Time interrupt calls/sec. */
 #define CONFIG_MIN_HZ 1
 #define CONFIG_MAX_HZ 500
+#define CONFIG_DEFAULT_DATASET_SCAN_HZ 10
+#define CONFIG_DEFAULT_DATASET_SCAN_TIME_LIMIT_US 250
 #define CRON_DBS_PER_CALL 16
 #define CRON_DICTS_PER_DB 16
 #define NET_MAX_WRITES_PER_EVENT (1024 * 64)
@@ -1608,8 +1610,8 @@ typedef struct datasetStats {
     long long value_size_histogram[VALUESIZE_HISTOGRAM_BUCKETS];
 } datasetStats;
 
-/* State for the incremental keyspace scan driven by databasesCron().
- * Each cron tick scans for up to DATASET_SCAN_TIME_LIMIT_US microseconds,
+/* State for the incremental keyspace scan driven by datasetScanTimeProc().
+ * Each tick scans for up to server.dataset_scan_time_limit_us microseconds,
  * resuming from where it left off. When all dbs are scanned, partial_results
  * is promoted to final_results and a new pass begins. */
 typedef struct datasetScanState {
@@ -1913,7 +1915,9 @@ struct valkeyServer {
     long long stat_total_active_defrag_time;       /* Total time memory fragmentation over the limit, unit us */
     monotime stat_last_active_defrag_time;         /* Timestamp of current active defrag start */
     size_t stat_peak_memory;                       /* Max used memory record */
-    datasetScanState dataset_scan;                 /* Cron-driven dataset statistics scan state */
+    datasetScanState dataset_scan;                 /* Incremental dataset statistics scan state */
+    int dataset_scan_hz;                           /* Dataset scan timer frequency in hertz */
+    int dataset_scan_time_limit_us;                /* Per-tick time budget for dataset scan in microseconds */
     long long stat_aof_rewrites;                   /* number of aof file rewrites performed */
     long long stat_aofrw_consecutive_failures;     /* The number of consecutive failures of aofrw */
     long long stat_rdb_saves;                      /* number of rdb saves performed */
@@ -3576,7 +3580,7 @@ robj *dbFindExpires(serverDb *db, sds key);
 robj *dbFindExpiresWithDictIndex(serverDb *db, sds key, int dict_index);
 unsigned long long dbSize(serverDb *db);
 unsigned long long dbScan(serverDb *db, unsigned long long cursor, kvstoreScanFunction scan_cb, void *privdata);
-void datasetScanCron(void);
+long long datasetScanTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
 
 /* Set data type */
 robj *setTypeCreate(sds value, size_t size_hint);

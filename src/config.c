@@ -3422,6 +3422,8 @@ standardConfig static_configs[] = {
     createIntConfig("key-load-delay", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, INT_MIN, INT_MAX, server.key_load_delay, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("active-expire-effort", NULL, MODIFIABLE_CONFIG, 1, 10, server.active_expire_effort, 1, INTEGER_CONFIG, NULL, NULL), /* From 1 to 10. */
     createIntConfig("hz", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.hz, CONFIG_DEFAULT_HZ, INTEGER_CONFIG, NULL, updateHZ),
+    createIntConfig("dataset-scan-hz", NULL, MODIFIABLE_CONFIG, 1, CONFIG_MAX_HZ, server.dataset_scan_hz, CONFIG_DEFAULT_DATASET_SCAN_HZ, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("dataset-scan-time-limit-us", NULL, MODIFIABLE_CONFIG, 1, 100000, server.dataset_scan_time_limit_us, CONFIG_DEFAULT_DATASET_SCAN_TIME_LIMIT_US, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-replicas-to-write", "min-slaves-to-write", MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_min_replicas_to_write, 0, INTEGER_CONFIG, NULL, updateGoodReplicas),
     createIntConfig("min-replicas-max-lag", "min-slaves-max-lag", MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_min_replicas_max_lag, 10, INTEGER_CONFIG, NULL, updateGoodReplicas),
     createIntConfig("watchdog-period", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.watchdog_period, 0, INTEGER_CONFIG, NULL, updateWatchdogPeriod),

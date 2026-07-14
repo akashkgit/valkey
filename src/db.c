@@ -2408,14 +2408,14 @@ static void datasetScanCallback(void *privdata, void *entry, int didx) {
     stats->memory_by_type[val->type] += val_size + key_len;
 }
 
-#define DATASET_SCAN_TIME_LIMIT_US 1000
-
 /* Incrementally scan the keyspace to collect dataset statistics.
- * Called once per serverCron tick, scanning for up to DATASET_SCAN_TIME_LIMIT_US
- * microseconds before yielding. Progresses through all dbs across multiple
- * ticks; when a full pass completes, partial_results is promoted to
- * final_results which is what DATASTATS commands read. */
-void datasetScanCron(void) {
+ * Each invocation scans for up to server.dataset_scan_time_limit_us
+ * microseconds before yielding. */
+long long datasetScanTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    UNUSED(eventLoop);
+    UNUSED(id);
+    UNUSED(clientData);
+
     datasetScanState *state = &server.dataset_scan;
 
     /* Previous pass finished — publish results and reset for next pass. */
@@ -2429,7 +2429,7 @@ void datasetScanCron(void) {
     /* Scan keys within the time budget for this tick. */
     monotime timer;
     elapsedStart(&timer);
-    while (elapsedUs(timer) < DATASET_SCAN_TIME_LIMIT_US &&
+    while (elapsedUs(timer) < (unsigned long long)server.dataset_scan_time_limit_us &&
            state->db_index < server.dbnum) {
         serverDb *db = server.db[state->db_index];
         if (db == NULL || kvstoreSize(db->keys) == 0) {
@@ -2445,6 +2445,8 @@ void datasetScanCron(void) {
             state->db_index++;
         }
     }
+
+    return 1000 / server.dataset_scan_hz;
 }
 
 /* -----------------------------------------------------------------------------
