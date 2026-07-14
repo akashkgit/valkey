@@ -139,6 +139,8 @@ struct ValkeyModule;
 #define CONFIG_DEFAULT_HZ 10 /* Time interrupt calls/sec. */
 #define CONFIG_MIN_HZ 1
 #define CONFIG_MAX_HZ 500
+#define CONFIG_DEFAULT_DATASET_SCAN_HZ 10
+#define CONFIG_DEFAULT_DATASET_SCAN_TIME_LIMIT_US 250
 #define CRON_DBS_PER_CALL 16
 #define CRON_DICTS_PER_DB 16
 #define NET_MAX_WRITES_PER_EVENT (1024 * 64)
@@ -770,6 +772,9 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_QUICKLIST 9  /* Encoded as linked list of listpacks */
 #define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
+/* Total number of encoding types, used to size encoding stats arrays */
+#define OBJ_ENCODING_MAX 12
+
 
 #define OBJ_REFCOUNT_BITS 29
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
@@ -1592,6 +1597,30 @@ struct serverMemOverhead {
     } *db;
 };
 
+
+#define KEYSIZE_HISTOGRAM_BUCKETS 6
+#define VALUESIZE_HISTOGRAM_BUCKETS 6
+
+/* Per-key statistics accumulated during a full keyspace scan. */
+typedef struct datasetStats {
+    long long key_count_by_type[OBJ_TYPE_MAX];
+    long long key_count_by_encoding[OBJ_ENCODING_MAX];
+    long long memory_by_type[OBJ_TYPE_MAX];
+    long long key_size_histogram[KEYSIZE_HISTOGRAM_BUCKETS];
+    long long value_size_histogram[VALUESIZE_HISTOGRAM_BUCKETS];
+} datasetStats;
+
+/* State for the incremental keyspace scan driven by datasetScanTimeProc().
+ * Each tick scans for up to server.dataset_scan_time_limit_us microseconds,
+ * resuming from where it left off. When all dbs are scanned, partial_results
+ * is promoted to final_results and a new pass begins. */
+typedef struct datasetScanState {
+    unsigned long long cursor;    /* kvstoreScan cursor within current db */
+    int db_index;                 /* db currently being scanned */
+    datasetStats partial_results; /* accumulator for the in-progress scan pass */
+    datasetStats final_results;   /* last completed scan, served by DATASTATS command */
+} datasetScanState;
+
 /* Replication error behavior determines the replica behavior
  * when it receives an error over the replication stream. In
  * either case the error is logged. */
@@ -1886,6 +1915,9 @@ struct valkeyServer {
     long long stat_total_active_defrag_time;       /* Total time memory fragmentation over the limit, unit us */
     monotime stat_last_active_defrag_time;         /* Timestamp of current active defrag start */
     size_t stat_peak_memory;                       /* Max used memory record */
+    datasetScanState dataset_scan;                 /* Incremental dataset statistics scan state */
+    int dataset_scan_hz;                           /* Dataset scan timer frequency in hertz */
+    int dataset_scan_time_limit_us;                /* Per-tick time budget for dataset scan in microseconds */
     long long stat_aof_rewrites;                   /* number of aof file rewrites performed */
     long long stat_aofrw_consecutive_failures;     /* The number of consecutive failures of aofrw */
     long long stat_rdb_saves;                      /* number of rdb saves performed */
@@ -3148,6 +3180,7 @@ robj *tryObjectEncoding(robj *o);
 robj *tryObjectEncodingEx(robj *o, int try_trim);
 robj *getDecodedObject(robj *o);
 size_t stringObjectLen(robj *o);
+size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid);
 robj *createStringObjectFromLongLong(long long value);
 robj *createStringObjectFromLongLongForValue(long long value);
 robj *createStringObjectFromLongLongWithSds(long long value);
@@ -3547,6 +3580,7 @@ robj *dbFindExpires(serverDb *db, sds key);
 robj *dbFindExpiresWithDictIndex(serverDb *db, sds key, int dict_index);
 unsigned long long dbSize(serverDb *db);
 unsigned long long dbScan(serverDb *db, unsigned long long cursor, kvstoreScanFunction scan_cb, void *privdata);
+long long datasetScanTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
 
 /* Set data type */
 robj *setTypeCreate(sds value, size_t size_hint);
@@ -3980,6 +4014,7 @@ void randomkeyCommand(client *c);
 void keysCommand(client *c);
 void scanCommand(client *c);
 void dbsizeCommand(client *c);
+void datastatsCommand(client *c);
 void lastsaveCommand(client *c);
 void saveCommand(client *c);
 void bgsaveCommand(client *c);

@@ -1322,6 +1322,7 @@ void databasesCron(void) {
         }
     }
 
+
     /* Start active defrag cycle or adjust defrag CPU if needed. */
     monitorActiveDefrag();
 
@@ -3080,6 +3081,11 @@ void initServer(void) {
      * on the client count. */
     if (aeCreateTimeEvent(server.el, 1, clientsTimeProc, NULL, NULL) == AE_ERR) {
         serverPanic("Can't create event clientsTimeProc timer.");
+        exit(1);
+    }
+    /* Dataset statistics scanning, configured independently via dataset-scan-hz. */
+    if (aeCreateTimeEvent(server.el, 1, datasetScanTimeProc, NULL, NULL) == AE_ERR) {
+        serverPanic("Can't create datasetScanTimeProc timer.");
         exit(1);
     }
 
