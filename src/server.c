@@ -5327,6 +5327,9 @@ int finishShutdown(void) {
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
 
+    /* To prevent valgrind leak errors, stop the IO threads so their cleanup handlers free per-thread resources */
+    killIOThreads();
+
     moduleUnloadAllModules();
 
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
