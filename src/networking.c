@@ -161,7 +161,10 @@ static int parseMultibulk(client *c,
                           unsigned long long *net_input_bytes_curr_cmd);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
-_Thread_local sds thread_shared_qb = NULL;
+/* Each thread's shared query buffer, indexed by thread ID, with that thread as the sole writer. */
+static sds thread_shared_qb_registry[IO_THREADS_MAX_NUM];
+/* The calling thread's query buffer, conditionally shared with the clients it serves. */
+#define thread_shared_qb (thread_shared_qb_registry[getCurTid()])
 
 typedef enum {
     PARSE_OK = 0,
