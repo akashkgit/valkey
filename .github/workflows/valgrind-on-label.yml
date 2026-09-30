@@ -13,7 +13,8 @@ name: On-Demand Labeled Valgrind
 on:
   pull_request_target:
     types: [labeled]
-  workflow_dispatch: {}   # FORK-TEST: manual "Run workflow" button so the fork can trigger it without a label/PR. Keep or drop upstream as desired.
+  # FORK-TEST: manual "Run workflow" button so the fork can trigger it without a label/PR. Keep or drop upstream as desired.
+  workflow_dispatch:
 
 concurrency:
   group: valgrind-${{ github.event.pull_request.number || github.ref }}
