@@ -1,0 +1,166 @@
+name: On-Demand Labeled Valgrind
+
+# Runs the memcheck (valgrind) test suite on demand when a maintainer adds the
+# `run-valgrind` label to a PR. Mirrors the four valgrind jobs in daily.yml, but
+# lets you trigger them per-PR without waiting for the nightly schedule or
+# pushing to a release branch. The label is removed at the end so it acts as a
+# one-shot button (re-add to re-run).
+#
+# NOTE: lines marked "# FORK-TEST:" were added/changed to let this run in a
+# personal fork for validation. Revert them (see each note) before proposing
+# this upstream to valkey-io/valkey.
+
+on:
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch: {}   # FORK-TEST: manual "Run workflow" button so the fork can trigger it without a label/PR. Keep or drop upstream as desired.
+
+concurrency:
+  group: valgrind-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  valgrind:
+    # Only fire for our label, and only on the canonical repo (the label-driven,
+    # secrets-bearing pull_request_target context must not run for arbitrary forks).
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' &&
+       github.event.label.name == 'run-valgrind')
+      # FORK-TEST: the canonical-repo guard below is commented out so this runs in a fork.
+      # UNCOMMENT (and AND-it into the condition above) before upstreaming:
+      # && github.repository == 'valkey-io/valkey'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same sharding as daily.yml's test-valgrind-test, plus a `misc` shard
+        # for the module-api + gtest unit tests (daily.yml's test-valgrind-misc).
+        shard: ["unit", "cluster", "integration-type", "misc"]
+        # Both the normal build and the NO_MALLOC_USABLE_SIZE build, matching
+        # daily.yml's two variants.
+        variant: ["default", "no-malloc-usable-size"]
+
+    steps:
+      - name: Checkout PR merge commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # FORK-TEST: on workflow_dispatch there is no PR merge commit, so fall
+          # back to the dispatched ref. Upstream (label path) still uses the PR
+          # merge commit. Revert to just `ref: ${{ github.event.pull_request.merge_commit_sha }}`.
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.ref }}
+          persist-credentials: false
+
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+          persist-credentials: false
+      - run: cd libbacktrace && ./configure && make && sudo make install
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tcl8.6 tclx valgrind
+          if [ "${{ matrix.shard }}" = "misc" ]; then
+            sudo apt-get install -y pkg-config libgtest-dev libgmock-dev
+          fi
+
+      - name: Build (variant=${{ matrix.variant }})
+        run: |
+          EXTRA_CFLAGS=""
+          if [ "${{ matrix.variant }}" = "no-malloc-usable-size" ]; then
+            EXTRA_CFLAGS='CFLAGS="-DNO_MALLOC_USABLE_SIZE"'
+          fi
+          if [ "${{ matrix.shard }}" = "misc" ]; then
+            eval make valgrind all-with-unit-tests SERVER_CFLAGS="'-Werror'" USE_LIBBACKTRACE=yes $EXTRA_CFLAGS
+          else
+            eval make valgrind SERVER_CFLAGS="'-Werror'" USE_LIBBACKTRACE=yes $EXTRA_CFLAGS
+          fi
+
+      - name: Run valgrind tests (shard=${{ matrix.shard }})
+        run: |
+          if [ "${{ matrix.shard }}" = "misc" ]; then
+            CFLAGS='-Werror' ./runtest-moduleapi --valgrind --no-latency \
+              --failures-output test-failures/moduleapi.json --verbose \
+              --clients 1 --timeout 2400 --dump-logs
+            if [ -f ./src/unit/valkey-unit-gtests ]; then
+              ./deps/gtest-parallel/gtest-parallel valgrind -- \
+                --track-origins=yes --suppressions=./src/valgrind.sup \
+                --show-reachable=no --show-possibly-lost=no --leak-check=full \
+                --log-file=err.%p.txt ./src/unit/valkey-unit-gtests --valgrind
+              if grep -qlE '0x[0-9A-Fa-f]+:' err.*.txt 2>/dev/null; then
+                grep -lE '0x[0-9A-Fa-f]+:' err.*.txt | xargs cat; exit 1;
+              fi
+            fi
+          else
+            case "${{ matrix.shard }}" in
+              unit)              shard_args=(--single tests/unit) ;;
+              cluster)           shard_args=(--single tests/unit/cluster) ;;
+              integration-type)  shard_args=(--single tests/integration --single tests/unit/type) ;;
+            esac
+            ./runtest --valgrind --no-latency \
+              --failures-output test-failures/valkey.json --verbose \
+              --clients 1 --timeout 2400 --dump-logs "${shard_args[@]}"
+          fi
+
+      - name: Upload test failures
+        if: always()
+        uses: ./.github/actions/upload-test-failures
+        with:
+          job-name: valgrind-${{ matrix.variant }}-${{ matrix.shard }}
+
+  report:
+    needs: valgrind
+    # FORK-TEST: canonical-repo guard removed here too; re-add
+    # `&& github.repository == 'valkey-io/valkey'` before upstreaming.
+    if: always() && (github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-valgrind')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Comment PR with valgrind result
+        # FORK-TEST: only comment when this was a PR (label) run; a manual
+        # workflow_dispatch has no PR to comment on.
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const result = '${{ needs.valgrind.result }}';
+            const sha = '${{ github.event.pull_request.head.sha }}';
+            const short = sha.slice(0, 7);
+            const emoji = result === 'success' ? '✅' : '❌';
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${emoji} **On-demand valgrind (memcheck)** for \`${short}\`: **${result}**.\n\n`
+                  + `Covered shards: unit, cluster, integration-type, misc × { default, no-malloc-usable-size }. `
+                  + `See the job logs / uploaded test-failures artifacts for any leak or uninitialised-value reports.`
+            });
+
+      - name: Remove run-valgrind label
+        # FORK-TEST: only meaningful on the PR (label) path.
+        if: always() && github.event_name == 'pull_request_target'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.removeLabel({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'run-valgrind'
+            }).catch(err => console.log('label not present', err.message));
