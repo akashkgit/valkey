@@ -29,13 +29,14 @@ jobs:
   valgrind:
     # Only fire for our label, and only on the canonical repo (the label-driven,
     # secrets-bearing pull_request_target context must not run for arbitrary forks).
+    #
+    # FORK-TEST: the canonical-repo guard is omitted so this runs in a fork.
+    # Before upstreaming, AND the following into the `if:` below:
+    #   && github.repository == 'valkey-io/valkey'
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event.action == 'labeled' &&
        github.event.label.name == 'run-valgrind')
-      # FORK-TEST: the canonical-repo guard below is commented out so this runs in a fork.
-      # UNCOMMENT (and AND-it into the condition above) before upstreaming:
-      # && github.repository == 'valkey-io/valkey'
 
     runs-on: ubuntu-latest
     timeout-minutes: 1440
