@@ -1,0 +1,166 @@
+name: Valgrind (reusable)
+
+# Reusable memcheck (valgrind) suite, called by:
+#   - daily.yml             (nightly schedule / non-unstable PRs / manual dispatch)
+#   - valgrind-on-label.yml (on demand, via the run-valgrind label)
+#
+# It owns the valgrind build + test recipe in ONE place so the two callers do not
+# duplicate it. Event gating (schedule vs PR vs label) stays in the callers; the
+# per-test-kind skip flags (skiptests) are honored here so the two callers behave
+# like daily.yml's original four jobs.
+#
+# Job display names are kept close to the original daily.yml job names. Because a
+# reusable-workflow call is always shown as "<caller job> / <reusable job>", the
+# caller job in daily.yml is named `test-valgrind`, so these render as e.g.
+# "test-valgrind / test (unit)" and "test-valgrind / no-malloc-usable-size misc".
+# The redundant "default" variant is omitted from the name.
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "owner/name of the repo to check out"
+        required: false
+        type: string
+        default: "valkey-io/valkey"
+      git_ref:
+        description: "git ref (branch/sha) to check out"
+        required: false
+        type: string
+        default: "unstable"
+      valgrind_test:
+        description: "single test file or directory to run instead of the full shards"
+        required: false
+        type: string
+        default: ""
+      skiptests:
+        description: "'valkey' skips the TCL suite; 'modules'+'unittest' skip the misc job"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  test:
+    # The TCL suite under valgrind, sharded. When `valgrind_test` is set, run just
+    # that single file/dir (the "targeted" shard) instead of the full shards.
+    # Skipped when the caller asked to skip the 'valkey' tests (matches daily.yml's
+    # original test-valgrind-* gate).
+    if: ${{ !contains(inputs.skiptests, 'valkey') }}
+    name: ${{ matrix.variant == 'no-malloc-usable-size' && 'no-malloc-usable-size ' || '' }}test (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.valgrind_test && '["targeted"]' || '["unit", "cluster", "integration-type"]') }}
+        variant: ["default", "no-malloc-usable-size"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.git_ref }}
+          persist-credentials: false
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+          persist-credentials: false
+      - run: cd libbacktrace && ./configure && make && sudo make install
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tcl8.6 tclx valgrind libzstd-dev
+      - name: Build
+        run: |
+          make_args=(valgrind SERVER_CFLAGS='-Werror' BUILD_ZSTD=yes USE_LIBBACKTRACE=yes)
+          if [ "${{ matrix.variant }}" = "no-malloc-usable-size" ]; then
+            make_args+=(CFLAGS="-DNO_MALLOC_USABLE_SIZE")
+          fi
+          make "${make_args[@]}"
+      - name: Test
+        env:
+          VALGRIND_TEST: ${{ inputs.valgrind_test }}
+        run: |
+          case "${{ matrix.shard }}" in
+            unit)             shard_args=(--single tests/unit) ;;
+            cluster)          shard_args=(--single tests/unit/cluster) ;;
+            integration-type) shard_args=(--single tests/integration --single tests/unit/type) ;;
+            targeted)         shard_args=(--single "$VALGRIND_TEST") ;;
+          esac
+          ./runtest --valgrind --no-latency --failures-output test-failures/valkey.json \
+            --verbose --clients 1 --timeout 2400 --dump-logs "${shard_args[@]}"
+      - name: Upload test failures
+        if: always()
+        uses: ./.github/actions/upload-test-failures
+        with:
+          job-name: valgrind-test-${{ matrix.variant }}-${{ matrix.shard }}
+
+  misc:
+    # Module-api tests + C unit (gtest) tests under valgrind. Skipped only when BOTH
+    # kinds are suppressed (matches daily.yml's original test-valgrind-*-misc gate:
+    # skiptests contains 'modules' AND 'unittest'); individual steps below still honor
+    # 'modules' / 'unittest' on their own.
+    if: ${{ !(contains(inputs.skiptests, 'modules') && contains(inputs.skiptests, 'unittest')) }}
+    name: ${{ matrix.variant == 'no-malloc-usable-size' && 'no-malloc-usable-size ' || '' }}misc
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ["default", "no-malloc-usable-size"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.git_ref }}
+          persist-credentials: false
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+          persist-credentials: false
+      - run: cd libbacktrace && ./configure && make && sudo make install
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tcl8.6 tclx valgrind libzstd-dev pkg-config libgtest-dev libgmock-dev
+      - name: Build
+        run: |
+          make_args=(valgrind all-with-unit-tests SERVER_CFLAGS='-Werror' BUILD_ZSTD=yes USE_LIBBACKTRACE=yes)
+          if [ "${{ matrix.variant }}" = "no-malloc-usable-size" ]; then
+            make_args+=(CFLAGS="-DNO_MALLOC_USABLE_SIZE")
+          fi
+          make "${make_args[@]}"
+      - name: Module API test
+        if: ${{ !contains(inputs.skiptests, 'modules') }}
+        run: |
+          CFLAGS='-Werror' ./runtest-moduleapi --valgrind --no-latency \
+            --failures-output test-failures/moduleapi.json --verbose \
+            --clients 1 --timeout 2400 --dump-logs
+      - name: C unit tests
+        if: ${{ !contains(inputs.skiptests, 'unittest') }}
+        run: |
+          if [ -f ./src/unit/valkey-unit-gtests ]; then
+            ./deps/gtest-parallel/gtest-parallel valgrind -- \
+              --track-origins=yes --suppressions=./src/valgrind.sup \
+              --show-reachable=no --show-possibly-lost=no --leak-check=full \
+              --log-file=err.%p.txt ./src/unit/valkey-unit-gtests --valgrind
+            if grep -qlE '0x[0-9A-Fa-f]+:' err.*.txt 2>/dev/null; then
+              grep -lE '0x[0-9A-Fa-f]+:' err.*.txt | xargs cat
+              exit 1
+            fi
+          elif [ -f ./src/valkey-unit-tests ]; then
+            valgrind --track-origins=yes --suppressions=./src/valgrind.sup \
+              --show-reachable=no --show-possibly-lost=no --leak-check=full \
+              --log-file=err.txt ./src/valkey-unit-tests --valgrind
+            if grep -q 0x err.txt; then cat err.txt; exit 1; fi
+          fi
+      - name: Upload test failures
+        if: always()
+        uses: ./.github/actions/upload-test-failures
+        with:
+          job-name: valgrind-misc-${{ matrix.variant }}
