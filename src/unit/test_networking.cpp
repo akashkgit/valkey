@@ -82,6 +82,13 @@ void testOnlySaveLastWrittenBuf(client *c, bufWriteMetadata *metadata, int bufcn
 void testOnlyTrimReplyUnusedTailSpace(client *c);
 /* Non-static engine function exercised directly by the deferred-reply tests. */
 void setDeferredReply(client *c, void *node, const char *s, size_t length);
+
+/* Client throttling (unified BLOCKED_THROTTLED) entry points exercised by the
+ * throttling-invariant tests. deferPipelineClient is static, hence the wrapper. */
+void testOnlyDeferPipelineClient(client *c);
+void pauseClientOnPendingCOB(client *c);
+void resumeClientPausedOnPendingCOB(client *c);
+void resumeOneDeferredPipelineClient(void);
 }
 
 /* Test fixture for networking tests - minimal fixture with no setup/teardown.
@@ -947,4 +954,150 @@ TEST_F(NetworkingTest, TestSetDeferredReplyNextMergeGuardsIoLastWritten) {
 
         freeReplyOffloadClient(c);
     }
+}
+
+/* ====================================================================
+ * Client throttling invariant: pipeline deferral and pause-on-pending-COB
+ * are unified under BLOCKED_THROTTLED and distinguished only by whether the
+ * client is enqueued in the deferral queue (generic_blocked_list_node). These
+ * tests lock that relationship so a future change to the block/unblock/convert
+ * paths that breaks "deferred => enqueued, COB-paused => not enqueued" fails
+ * loudly here.
+ * ==================================================================== */
+/* The throttle sub-state predicates are only needed by these tests (engine code inlines the
+ * checks), so define them locally rather than export otherwise-unused macros from server.h. */
+#define isPipelineDeferralClient(c) (isClientThrottled(c) && (c)->bstate->is_deferred)
+#define isClientPausedOnPendingCOB(c) (isClientThrottled(c) && !(c)->bstate->is_deferred)
+
+class ThrottlingInvariantTest : public ::testing::Test {
+  protected:
+    static inline ConnectionType dummyConnType = {0};
+
+    static int dummySetReadHandler(connection *conn, ConnectionCallbackFunc func) {
+        conn->read_handler = func;
+        return C_OK;
+    }
+
+    void SetUp() override {
+        dummyConnType.set_read_handler = dummySetReadHandler;
+        server.unblocked_clients = listCreate();
+        server.pipeline_deferral.queue = listCreate();
+        /* Pretend the wakeup timer is already scheduled so deferPipelineClient does
+         * not reach aeCreateTimeEvent (which would need a real event loop). */
+        server.pipeline_deferral.timer_proc_active = true;
+        server.pipeline_deferral.total_deferrals = 0;
+        server.total_cob_pauses = 0;
+        server.pause_clients_on_pending_cob = 1;
+        server.blocked_clients = 0;
+        memset(server.blocked_clients_by_type, 0, sizeof(server.blocked_clients_by_type));
+    }
+
+    void TearDown() override {
+        listRelease(server.pipeline_deferral.queue);
+        server.pipeline_deferral.queue = NULL;
+        listRelease(server.unblocked_clients);
+        server.unblocked_clients = NULL;
+    }
+
+    client *makeNormalClient(uint64_t id) {
+        client *c = (client *)zcalloc(sizeof(client));
+        c->id = id;
+        c->conn = (connection *)zcalloc(sizeof(connection));
+        c->conn->type = &dummyConnType;
+        c->conn->read_handler = (ConnectionCallbackFunc)1;
+        c->flag.pending_command = 1;
+        return c;
+    }
+
+    void freeClient(client *c) {
+        freeClientBlockingState(c);
+        zfree(c->conn);
+        zfree(c);
+    }
+};
+
+/* Deferral enqueues: the client becomes BLOCKED_THROTTLED with a non-NULL queue
+ * node, is added to the deferral queue, and classifies as deferred (not COB). */
+TEST_F(ThrottlingInvariantTest, DeferralEnqueuesClient) {
+    client *c = makeNormalClient(1);
+
+    testOnlyDeferPipelineClient(c);
+
+    EXPECT_TRUE(c->flag.blocked);
+    EXPECT_EQ(c->bstate->btype, BLOCKED_THROTTLED);
+    EXPECT_TRUE(c->bstate->is_deferred);
+    EXPECT_NE(c->bstate->generic_blocked_list_node, nullptr);
+    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 1u);
+    EXPECT_TRUE(isPipelineDeferralClient(c));
+    EXPECT_FALSE(isClientPausedOnPendingCOB(c));
+    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_THROTTLED], 1u);
+
+    unblockClient(c, 0);
+    EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
+    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
+    freeClient(c);
+}
+
+/* COB-pause does NOT enqueue: the client becomes BLOCKED_THROTTLED with a NULL
+ * queue node, the deferral queue stays empty, and it classifies as COB-paused. */
+TEST_F(ThrottlingInvariantTest, CobPauseDoesNotEnqueueClient) {
+    client *c = makeNormalClient(1);
+
+    pauseClientOnPendingCOB(c);
+
+    EXPECT_TRUE(c->flag.blocked);
+    EXPECT_EQ(c->bstate->btype, BLOCKED_THROTTLED);
+    EXPECT_FALSE(c->bstate->is_deferred);
+    EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
+    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
+    EXPECT_TRUE(isClientPausedOnPendingCOB(c));
+    EXPECT_FALSE(isPipelineDeferralClient(c));
+    EXPECT_EQ(server.total_cob_pauses, 1ull);
+
+    unblockClient(c, 0);
+    freeClient(c);
+}
+
+/* Converting a deferred client to COB-pause dequeues it: the node goes NULL, the
+ * deferral queue empties, and the client reclassifies from deferred to COB-paused
+ * while staying throttled the whole time. */
+TEST_F(ThrottlingInvariantTest, DeferralToCobConversionDequeues) {
+    client *c = makeNormalClient(1);
+
+    testOnlyDeferPipelineClient(c);
+    ASSERT_TRUE(isPipelineDeferralClient(c));
+    ASSERT_EQ(listLength(server.pipeline_deferral.queue), 1u);
+
+    /* The write path finds the COB cannot flush and converts the deferred client. */
+    pauseClientOnPendingCOB(c);
+
+    EXPECT_TRUE(c->flag.blocked);
+    EXPECT_EQ(c->bstate->btype, BLOCKED_THROTTLED);
+    EXPECT_FALSE(c->bstate->is_deferred);
+    EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
+    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
+    EXPECT_TRUE(isClientPausedOnPendingCOB(c));
+    EXPECT_FALSE(isPipelineDeferralClient(c));
+
+    unblockClient(c, 0);
+    freeClient(c);
+}
+
+/* Resuming a deferred client via the unblock path clears the queue node and
+ * removes it from the deferral queue. */
+TEST_F(ThrottlingInvariantTest, ResumeDeferredClearsNode) {
+    client *c = makeNormalClient(1);
+
+    testOnlyDeferPipelineClient(c);
+    ASSERT_NE(c->bstate->generic_blocked_list_node, nullptr);
+
+    resumeOneDeferredPipelineClient(); /* pops head, unblockClient(c, 1) */
+
+    EXPECT_FALSE(c->flag.blocked);
+    EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
+    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
+
+    /* resumeOneDeferredPipelineClient queued it for reprocessing. */
+    EXPECT_EQ(listLength(server.unblocked_clients), 1u);
+    freeClient(c);
 }

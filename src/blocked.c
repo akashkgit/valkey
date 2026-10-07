@@ -92,6 +92,7 @@ void initClientBlockingState(client *c) {
     c->bstate->generic_blocked_list_node = NULL;
     c->bstate->module_blocked_handle = NULL;
     c->bstate->async_rm_call_handle = NULL;
+    c->bstate->is_deferred = false;
 }
 
 void freeClientBlockingState(client *c) {
@@ -242,16 +243,13 @@ void unblockClient(client *c, int queue_for_reprocessing) {
     case BLOCKED_INUSE:
         unlinkBlockInUseClient(c);
         break;
-    case BLOCKED_DEFER:
-        /* Remove from the pipeline deferral queue (node stored in the generic list node). */
-        if (c->bstate->generic_blocked_list_node) {
+    case BLOCKED_THROTTLED:
+        /* Deferred clients are enqueued (node set); COB-paused clients are not. Dequeue if present. */
+        if (c->bstate->is_deferred) {
             listDelNode(server.pipeline_deferral.queue, c->bstate->generic_blocked_list_node);
             c->bstate->generic_blocked_list_node = NULL;
+            c->bstate->is_deferred = false;
         }
-        break;
-    case BLOCKED_COB_PAUSE:
-        /* No container to clean up: a COB-paused client is released reactively by the write
-         * path the moment its own socket drains, so it is not enqueued anywhere. */
         break;
     default:
         serverPanic("Unknown btype in unblockClient().");
@@ -260,14 +258,9 @@ void unblockClient(client *c, int queue_for_reprocessing) {
     /* Reset the client for a new query, unless the client has pending command to process
      * or in case a shutdown operation was canceled and we are still in the processCommand sequence.
      *
-     * BLOCKED_DEFER and BLOCKED_COB_PAUSE are also excluded: these throttling states suspend a
-     * client with partially-parsed input still in its query buffer (mid-pipeline for DEFER,
-     * possibly mid-parse of the next command for COB-pause). They resume by CONTINUING to parse
-     * that buffer (processInputBuffer), not by restarting a command, so calling resetClient here
-     * would wipe argv/per-command parse state while multibulklen/bulklen/qb_pos still reference
-     * the buffered-but-unparsed bytes, corrupting the next parse. */
+     * BLOCKED_THROTTLED is excluded: it suspends a client mid-parse, and resetClient would free the in-flight argv while multibulklen/qb_pos still point into the unparsed buffer, corrupting the resumed parse. */
     if (!c->flag.pending_command && c->bstate->btype != BLOCKED_SHUTDOWN &&
-        c->bstate->btype != BLOCKED_DEFER && c->bstate->btype != BLOCKED_COB_PAUSE) {
+        c->bstate->btype != BLOCKED_THROTTLED) {
         /* Clients that are not blocked on keys are not reprocessed so we must
          * call reqresAppendResponse here (for clients blocked on key,
          * unblockClientOnKey is called, which eventually calls processCommand,

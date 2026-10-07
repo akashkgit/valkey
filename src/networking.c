@@ -145,7 +145,7 @@ int postponeClientRead(client *c);
 char *getClientSockname(client *c);
 static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter);
 static inline void deferPipelineClient(client *c);
-static inline void removePipelineDeferralClient(client *c);
+static inline int removePipelineDeferralClient(client *c);
 void pauseClientOnPendingCOB(client *c);
 void resumeClientPausedOnPendingCOB(client *c);
 static int clientMatchesFilter(client *client, clientFilter *client_filter);
@@ -2289,10 +2289,7 @@ void unlinkClient(client *c) {
         c->flag.unblocked = 0;
     }
 
-    /* Defensive: ensure the client is not left in the deferral queue. In the normal
-     * freeClient path this is already handled by unblockClient()'s BLOCKED_DEFER case
-     * (freeClient calls unblockClient before unlinkClient), so this is a no-op there; it
-     * guards against any path that reaches unlinkClient with a still-queued deferred client. */
+    /* Defensive: drop a still-queued deferred client so freeing it leaves no dangling queue node. */
     removePipelineDeferralClient(c);
 
     /* Clear the tracking status. */
@@ -3511,9 +3508,8 @@ int postWriteToClient(client *c) {
             connSetWriteHandler(c->conn, NULL);
         }
 
-        /* COB fully flushed: if this client was paused because its output buffer could not be
-         * flushed, resume it now (re-arm reads, reprocess pending input). */
-        if (isClientPausedOnPendingCOB(c)) resumeClientPausedOnPendingCOB(c);
+        /* Resume the client if it was paused before */
+        resumeClientPausedOnPendingCOB(c);
 
         /* Close connection after entire reply has been sent. */
         if (c->flag.close_after_reply) {
@@ -7216,7 +7212,7 @@ static long long deferredPipelineTimeProc(struct aeEventLoop *eventLoop, long lo
 
     if (listLength(server.pipeline_deferral.queue) == 0) {
         server.pipeline_deferral.timer_proc_active = false;
-        return AE_NOMORE; // turn off the wakeup timer
+        return AE_NOMORE;
     }
     
     resumeOneDeferredPipelineClient();
@@ -7237,62 +7233,66 @@ void resumeOneDeferredPipelineClient(void) {
 static inline void deferPipelineClient(client *c) {
     serverAssert(!c->flag.blocked);
 
-    blockClient(c, BLOCKED_DEFER);
-
-    /* enqueue: add to the tail; remember the node in the blocking state's generic list node. */
+    /* Block the client and stop listening for new read events for this client */
+    blockClient(c, BLOCKED_THROTTLED);
+    c->bstate->is_deferred = true;
+    connSetReadHandler(c->conn, NULL);
+    
+    /* Add the client to deferred queue and cache the list node */
     list *queue = server.pipeline_deferral.queue;
     listAddNodeTail(queue, c);
-    c->bstate->generic_blocked_list_node = listLast(queue); /* cached for O(1) removal later */
     server.pipeline_deferral.total_deferrals++;
+    c->bstate->generic_blocked_list_node = listLast(queue);
+    
 
-    // Pause reading new commands for this client.
-    connSetReadHandler(c->conn, NULL);
-
+    /* create the timer event to process deferred clients */
     if (!server.pipeline_deferral.timer_proc_active) {
         server.pipeline_deferral.timer_proc_active = true;
         aeCreateTimeEvent(server.el, 0, deferredPipelineTimeProc, NULL, NULL);
     }
 }
 
-/* Remove a client from the deferral queue. Called from unblockClient()'s BLOCKED_DEFER case
- * and from unlinkClient() (so a client freed while deferred leaves no dangling queue node).
- * This only touches the queue/node; the blocking-state teardown is done by unblockClient(). */
-static inline void removePipelineDeferralClient(client *c) {
-    if (!isPipelineDeferralClient(c)) return;
-
-    if (c->bstate->generic_blocked_list_node) {
+/* Remove a client from the deferral queue; blocking-state teardown is done by unblockClient().
+ * Returns 1 if the client was a deferred client and was dequeued, 0 otherwise. */
+static inline int removePipelineDeferralClient(client *c) {
+    if (isClientThrottled(c) && c->bstate->is_deferred) {
         listDelNode(server.pipeline_deferral.queue, c->bstate->generic_blocked_list_node);
         c->bstate->generic_blocked_list_node = NULL;
+        c->bstate->is_deferred = false;
+        return 1;
     }
+    return 0;
 }
 
 /* Pause-on-pending-COB */
 void pauseClientOnPendingCOB(client *c) {
+    /* Skip pausing if its disabled*/
     if (server.pause_clients_on_pending_cob == 0) return;
-
-    if (!c->conn || getClientType(c) != CLIENT_TYPE_NORMAL) return;
-
-    if (c->flag.blocked) {
-        if (c->bstate->btype == BLOCKED_DEFER) {
-            /* clears BLOCKED_DEFER (dequeues), no reprocessing */
-            unblockClient(c, 0); 
-        } else {
-            /* If blocked on any other type (including COB), we do not block again. */
-            return;
-        }
-    }
-    /* An unblocked-but-not-yet-reprocessed client is owned by processUnblockedClients(); blockClient()
-     * doesn't guard against flag.unblocked, so skip it here to avoid double-driving its pending command. */
+    /* Only pause normal customer clients */
+    if (getClientType(c) != CLIENT_TYPE_NORMAL) return;
+    /* A general proactive guard preventing pause on an unblocked client that will be handled by handleunblockedclients()*/
     if (c->flag.unblocked) return;
 
-    blockClient(c, BLOCKED_COB_PAUSE);
+    /* Handle already blocked cases */
+    if (removePipelineDeferralClient(c) == 1) {
+        /* A deferred client moves to a 'paused due to COB' state; read handler already uninstalled. */
+        server.total_cob_pauses++;
+        return;
+    } else if (c->flag.blocked) {
+        // we do nothing for other blocking types.
+        return;
+    }
+
+    /* Pause processing and reading of inputs to avoid COB growth as client is having trouble draining the replies */
+    blockClient(c, BLOCKED_THROTTLED);
+    c->bstate->is_deferred = false;
     server.total_cob_pauses++;
     connSetReadHandler(c->conn, NULL);
 }
 
 /* Release a client that was paused on pending COB */
 void resumeClientPausedOnPendingCOB(client *c) {
-    if (c->flag.blocked && c->bstate->btype == BLOCKED_COB_PAUSE) {
+    if (isClientThrottled(c) && !(c)->bstate->is_deferred) {
         unblockClient(c, 1);
     }
 }
@@ -7432,4 +7432,8 @@ void testOnlySaveLastWrittenBuf(client *c, bufWriteMetadata *metadata, int bufcn
 
 void testOnlyTrimReplyUnusedTailSpace(client *c) {
     trimReplyUnusedTailSpace(c);
+}
+
+void testOnlyDeferPipelineClient(client *c) {
+    deferPipelineClient(c);
 }

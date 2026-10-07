@@ -363,8 +363,7 @@ typedef enum blocking_type {
     BLOCKED_POSTPONE, /* Blocked by processCommand, re-try processing later. */
     BLOCKED_SHUTDOWN, /* SHUTDOWN. */
     BLOCKED_INUSE,    /* Key in use by background thread. */
-    BLOCKED_DEFER,    /* Blocked for overcoming execution or cob limits */
-    BLOCKED_COB_PAUSE, /* Reads paused because the client-output-buffer could not be flushed */
+    BLOCKED_THROTTLED, /* Runnable client held back by pipeline deferral or pause-on-pending-COB. */
     BLOCKED_NUM,      /* Number of blocked states. */
     BLOCKED_END       /* End of enumeration */
 } blocking_type;
@@ -1061,13 +1060,15 @@ typedef struct blockingState {
     void *async_rm_call_handle; /* ValkeyModuleAsyncRMCallPromise structure.
                                    which is opaque for the Redis core, only
                                    handled in module.c. */
+
+    bool is_deferred;
 } blockingState;
 
 /* Structure to track pipeline deferrals */
 typedef struct {
     unsigned int execution_limit_ms;
     unsigned int cob_limit_bytes;
-    list *queue;                        // Queue of deferred pipeline clients (BLOCKED_DEFER)
+    list *queue;                        // Queue of deferred pipeline clients
     unsigned long long total_deferrals; // Total number of times pipeline clients are deferred.
                                         // This value is never decremented.
     bool timer_proc_active;             // A wakeup timer is scheduled. Deviation: the timer only
@@ -2106,7 +2107,7 @@ struct valkeyServer {
     int hide_user_data_from_log; /* Hide or redact user data, or data that may contain user data, from the log. */
     int maxidletime;             /* Client timeout in seconds */
     int tcpkeepalive;            /* Set SO_KEEPALIVE if non-zero. */
-    int pause_clients_on_pending_cob; /* Pause a client instead of letting its COB grow (BLOCKED_COB_PAUSE). */
+    int pause_clients_on_pending_cob; /* Pause a client instead of letting its COB grow. */
     int active_expire_enabled;   /* Can be disabled for testing purposes. */
     int active_expire_effort;    /* From 1 (default) to 10, active effort. */
     int lazy_expire_disabled;    /* If > 0, don't trigger lazy expire */
@@ -3103,10 +3104,7 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
 
-/* True if the client is blocked in the pipeline-deferral throttling state (BLOCKED_DEFER). */
-#define isPipelineDeferralClient(c) ((c)->flag.blocked && (c)->bstate && (c)->bstate->btype == BLOCKED_DEFER)
-/* True if the client is paused because its client-output-buffer could not be flushed (BLOCKED_COB_PAUSE). */
-#define isClientPausedOnPendingCOB(c) ((c)->flag.blocked && (c)->bstate && (c)->bstate->btype == BLOCKED_COB_PAUSE)
+#define isClientThrottled(c) ((c)->flag.blocked && (c)->bstate && (c)->bstate->btype == BLOCKED_THROTTLED)
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)

@@ -336,15 +336,14 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
 
 
 # ---------------------------------------------------------------------------
-# Client throttling: pipeline deferral (BLOCKED_DEFER) and
-# pause-on-pending-COB (BLOCKED_COB_PAUSE).
+# Client throttling: pipeline deferral and pause-on-pending-COB, unified under
+# the single BLOCKED_THROTTLED block type (deferred clients are enqueued;
+# COB-paused clients are not).
 #
 # Both features suspend a runnable client via the blocking framework and resume
-# it later. They are observable through INFO stats counters:
-#   amz_total_pipeline_deferral_lifetime            (deferral, lifetime counter)
-#   amz_current_num_pipeline_deferral_clients       (deferral, current gauge)
-#   amz_total_clients_paused_on_pending_cob_lifetime (COB-pause, lifetime counter)
-#   amz_current_num_clients_paused_on_pending_cob    (COB-pause, current gauge)
+# it later. They are observable through INFO stats lifetime counters:
+#   total_deferred_pipeline_clients   (deferral, lifetime counter)
+#   total_paused_on_cob_clients       (COB-pause, lifetime counter)
 # ---------------------------------------------------------------------------
 start_server {tags {"networking external:skip"}} {
 
@@ -362,7 +361,7 @@ start_server {tags {"networking external:skip"}} {
         r config set pause-clients-on-pending-cob no
         r flushall
 
-        set before [status r amz_total_pipeline_deferral_lifetime]
+        set before [status r total_deferred_pipeline_clients]
 
         # Send a big pipeline of distinct SET commands over ONE raw connection, then read all
         # replies. The server must defer mid-batch (yielding the event loop) and resume via the
@@ -379,12 +378,11 @@ start_server {tags {"networking external:skip"}} {
         # The whole batch landed (continuation correctness) ...
         assert_equal $n [r dbsize]
         # ... and deferral actually fired.
-        set after [status r amz_total_pipeline_deferral_lifetime]
+        set after [status r total_deferred_pipeline_clients]
         assert {$after > $before}
 
         # Server stayed responsive and no client is left parked.
         assert_equal {PONG} [r ping]
-        assert_equal 0 [status r amz_current_num_pipeline_deferral_clients]
         assert_equal 0 [status r blocked_clients]
     }
 
@@ -399,7 +397,7 @@ start_server {tags {"networking external:skip"}} {
         # client that never reads.
         r set big [string repeat x 100000]
 
-        set paused_before [status r amz_total_clients_paused_on_pending_cob_lifetime]
+        set paused_before [status r total_paused_on_cob_clients]
 
         # Deferring client that WRITES but does not read -> its server-side COB cannot drain.
         set rd [valkey_deferring_client]
@@ -408,27 +406,23 @@ start_server {tags {"networking external:skip"}} {
         $rd write $payload
         $rd flush
 
-        # The server should pause this client (read handler off) rather than evict it.
+        # The server should pause this client (read handler off) rather than evict it. Observe it
+        # through the lifetime counter advancing (current gauge is no longer exported).
         wait_for_condition 50 100 {
-            [status r amz_current_num_clients_paused_on_pending_cob] >= 1
+            [status r total_paused_on_cob_clients] > $paused_before
         } else {
             fail "client was not paused on pending COB"
         }
 
-        # Lifetime counter advanced, and the client is still connected (paused, not disconnected).
-        assert {[status r amz_total_clients_paused_on_pending_cob_lifetime] > $paused_before}
+        # The client is still connected (paused, not disconnected).
         assert {[status r connected_clients] >= 2}
         # A separate client is still served normally while the slow one is parked.
         assert_equal {PONG} [r ping]
 
         # Read ALL replies so the socket fully drains; the server resumes reading the client
-        # (write path -> resumeClientPausedOnPendingCOB) and the pause gauge returns to zero.
-        for {set i 0} {$i < 100} {incr i} { $rd read }
-        wait_for_condition 50 100 {
-            [status r amz_current_num_clients_paused_on_pending_cob] == 0
-        } else {
-            fail "client was not resumed after COB drained"
-        }
+        # (write path -> resumeClientPausedOnPendingCOB) and the batch completes cleanly. Reading
+        # all 100 replies back only succeeds if the paused client was resumed.
+        for {set i 0} {$i < 100} {incr i} { assert_equal [string repeat x 100000] [$rd read] }
         $rd close
     }
 
@@ -438,8 +432,8 @@ start_server {tags {"networking external:skip"}} {
         r config set pause-clients-on-pending-cob yes
         r flushall
 
-        set defer_before [status r amz_total_pipeline_deferral_lifetime]
-        set pause_before [status r amz_total_clients_paused_on_pending_cob_lifetime]
+        set defer_before [status r total_deferred_pipeline_clients]
+        set pause_before [status r total_paused_on_cob_clients]
 
         # A big pipeline that both takes time (triggers deferral) and whose replies a non-reading
         # client cannot drain (can trigger COB-pause). The two states must not stack or corrupt
@@ -462,17 +456,12 @@ start_server {tags {"networking external:skip"}} {
         $rd close
 
         # At least one of the two throttling features engaged during the run.
-        set defer_after [status r amz_total_pipeline_deferral_lifetime]
-        set pause_after [status r amz_total_clients_paused_on_pending_cob_lifetime]
+        set defer_after [status r total_deferred_pipeline_clients]
+        set pause_after [status r total_paused_on_cob_clients]
         assert {$defer_after > $defer_before || $pause_after > $pause_before}
 
-        # Everything settled: no clients left parked in either state.
-        wait_for_condition 50 100 {
-            [status r amz_current_num_pipeline_deferral_clients] == 0 &&
-            [status r amz_current_num_clients_paused_on_pending_cob] == 0
-        } else {
-            fail "a client was left parked after the run"
-        }
+        # Everything settled: the server is responsive and nothing is left blocked.
+        assert_equal {PONG} [r ping]
         assert_equal 0 [status r blocked_clients]
 
         # Restore defaults.
