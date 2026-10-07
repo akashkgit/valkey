@@ -363,11 +363,12 @@ start_server {tags {"networking external:skip"}} {
 
         set before [status r total_deferred_pipeline_clients]
 
-        # Send a big pipeline of distinct SET commands over ONE raw connection, then read all
-        # replies. The server must defer mid-batch (yielding the event loop) and resume via the
-        # blocking framework, continuing the batch — so every reply must still come back.
+        # Deferral fires only when a SINGLE processInputBuffer() pass exceeds the time budget
+        # (startTime is captured per call), so the pipeline must be large enough that parsing +
+        # executing it in one pass reliably takes >1ms even on a fast optimized build. 3000 was
+        # borderline and flaked on fast hardware; 50000 gives a wide margin without being slow.
         set rd [valkey_deferring_client]
-        set n 3000
+        set n 50000
         set payload ""
         for {set i 0} {$i < $n} {incr i} { append payload [_resp_cmd SET "dk:$i" "v$i"] }
         $rd write $payload
