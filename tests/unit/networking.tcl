@@ -333,3 +333,150 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
         }
     }
 }
+
+
+# ---------------------------------------------------------------------------
+# Client throttling: pipeline deferral (BLOCKED_DEFER) and
+# pause-on-pending-COB (BLOCKED_COB_PAUSE).
+#
+# Both features suspend a runnable client via the blocking framework and resume
+# it later. They are observable through INFO stats counters:
+#   amz_total_pipeline_deferral_lifetime            (deferral, lifetime counter)
+#   amz_current_num_pipeline_deferral_clients       (deferral, current gauge)
+#   amz_total_clients_paused_on_pending_cob_lifetime (COB-pause, lifetime counter)
+#   amz_current_num_clients_paused_on_pending_cob    (COB-pause, current gauge)
+# ---------------------------------------------------------------------------
+start_server {tags {"networking external:skip"}} {
+
+    # Build a single raw RESP payload with `count` copies of the given command.
+    proc _resp_cmd {args} {
+        set s "*[llength $args]\r\n"
+        foreach a $args { append s "\$[string length $a]\r\n$a\r\n" }
+        return $s
+    }
+
+    test {pipeline deferral: a large pipeline on one connection triggers deferral} {
+        # Deferral on a tight time budget; COB-pause off so this test is isolated.
+        r config set pipelined-commands-time-limit-ms 1
+        r config set pipelined-commands-cob-limit-bytes 0
+        r config set pause-clients-on-pending-cob no
+        r flushall
+
+        set before [status r amz_total_pipeline_deferral_lifetime]
+
+        # Send a big pipeline of distinct SET commands over ONE raw connection, then read all
+        # replies. The server must defer mid-batch (yielding the event loop) and resume via the
+        # blocking framework, continuing the batch — so every reply must still come back.
+        set rd [valkey_deferring_client]
+        set n 3000
+        set payload ""
+        for {set i 0} {$i < $n} {incr i} { append payload [_resp_cmd SET "dk:$i" "v$i"] }
+        $rd write $payload
+        $rd flush
+        for {set i 0} {$i < $n} {incr i} { assert_equal {OK} [$rd read] }
+        $rd close
+
+        # The whole batch landed (continuation correctness) ...
+        assert_equal $n [r dbsize]
+        # ... and deferral actually fired.
+        set after [status r amz_total_pipeline_deferral_lifetime]
+        assert {$after > $before}
+
+        # Server stayed responsive and no client is left parked.
+        assert_equal {PONG} [r ping]
+        assert_equal 0 [status r amz_current_num_pipeline_deferral_clients]
+        assert_equal 0 [status r blocked_clients]
+    }
+
+    test {pause-on-pending-COB: a slow reader is paused, not disconnected, then resumes} {
+        # COB-pause on; deferral off so this test is isolated.
+        r config set pause-clients-on-pending-cob yes
+        r config set pipelined-commands-time-limit-ms 0
+        r config set pipelined-commands-cob-limit-bytes 0
+        r flushall
+
+        # A large value so a few GETs fill the client output buffer the server cannot flush to a
+        # client that never reads.
+        r set big [string repeat x 100000]
+
+        set paused_before [status r amz_total_clients_paused_on_pending_cob_lifetime]
+
+        # Deferring client that WRITES but does not read -> its server-side COB cannot drain.
+        set rd [valkey_deferring_client]
+        set payload ""
+        for {set i 0} {$i < 100} {incr i} { append payload [_resp_cmd GET big] }
+        $rd write $payload
+        $rd flush
+
+        # The server should pause this client (read handler off) rather than evict it.
+        wait_for_condition 50 100 {
+            [status r amz_current_num_clients_paused_on_pending_cob] >= 1
+        } else {
+            fail "client was not paused on pending COB"
+        }
+
+        # Lifetime counter advanced, and the client is still connected (paused, not disconnected).
+        assert {[status r amz_total_clients_paused_on_pending_cob_lifetime] > $paused_before}
+        assert {[status r connected_clients] >= 2}
+        # A separate client is still served normally while the slow one is parked.
+        assert_equal {PONG} [r ping]
+
+        # Read ALL replies so the socket fully drains; the server resumes reading the client
+        # (write path -> resumeClientPausedOnPendingCOB) and the pause gauge returns to zero.
+        for {set i 0} {$i < 100} {incr i} { $rd read }
+        wait_for_condition 50 100 {
+            [status r amz_current_num_clients_paused_on_pending_cob] == 0
+        } else {
+            fail "client was not resumed after COB drained"
+        }
+        $rd close
+    }
+
+    test {deferral + COB-pause together: both features active, server stays correct} {
+        r config set pipelined-commands-time-limit-ms 1
+        r config set pipelined-commands-cob-limit-bytes 0
+        r config set pause-clients-on-pending-cob yes
+        r flushall
+
+        set defer_before [status r amz_total_pipeline_deferral_lifetime]
+        set pause_before [status r amz_total_clients_paused_on_pending_cob_lifetime]
+
+        # A big pipeline that both takes time (triggers deferral) and whose replies a non-reading
+        # client cannot drain (can trigger COB-pause). The two states must not stack or corrupt
+        # each other (a deferred client that then can't flush is CONVERTED to COB-pause).
+        r set big [string repeat x 20000]
+        set rd [valkey_deferring_client]
+        set n 300
+        set payload ""
+        for {set i 0} {$i < $n} {incr i} { append payload [_resp_cmd GET big] }
+        $rd write $payload
+        $rd flush
+
+        # Give the server passes to defer and/or pause the client.
+        after 300
+        # The server must remain responsive to other clients regardless of the writer's state.
+        assert_equal {PONG} [r ping]
+
+        # Drain fully; it must complete cleanly (all $n bulk replies) with no disconnect.
+        for {set i 0} {$i < $n} {incr i} { $rd read }
+        $rd close
+
+        # At least one of the two throttling features engaged during the run.
+        set defer_after [status r amz_total_pipeline_deferral_lifetime]
+        set pause_after [status r amz_total_clients_paused_on_pending_cob_lifetime]
+        assert {$defer_after > $defer_before || $pause_after > $pause_before}
+
+        # Everything settled: no clients left parked in either state.
+        wait_for_condition 50 100 {
+            [status r amz_current_num_pipeline_deferral_clients] == 0 &&
+            [status r amz_current_num_clients_paused_on_pending_cob] == 0
+        } else {
+            fail "a client was left parked after the run"
+        }
+        assert_equal 0 [status r blocked_clients]
+
+        # Restore defaults.
+        r config set pipelined-commands-time-limit-ms 20
+        r config set pause-clients-on-pending-cob no
+    }
+}

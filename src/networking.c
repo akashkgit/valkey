@@ -146,6 +146,8 @@ char *getClientSockname(client *c);
 static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter);
 static inline void deferPipelineClient(client *c);
 static inline void removePipelineDeferralClient(client *c);
+void pauseClientOnPendingCOB(client *c);
+void resumeClientPausedOnPendingCOB(client *c);
 static int clientMatchesFilter(client *client, clientFilter *client_filter);
 static int validateClientFlagFilter(sds flag_filter);
 static int validateClientCapaFilter(sds capa);
@@ -2287,10 +2289,10 @@ void unlinkClient(client *c) {
         c->flag.unblocked = 0;
     }
 
-    /* Remove the client from the queue of deferred pipeline clients, if present.
-     * Without this, a client freed while deferred would leave a dangling list node
-     * in server.pipeline_deferral.queue, leading to a use-after-free when the
-     * pipeline timer later dequeues it. */
+    /* Defensive: ensure the client is not left in the deferral queue. In the normal
+     * freeClient path this is already handled by unblockClient()'s BLOCKED_DEFER case
+     * (freeClient calls unblockClient before unlinkClient), so this is a no-op there; it
+     * guards against any path that reaches unlinkClient with a still-queued deferred client. */
     removePipelineDeferralClient(c);
 
     /* Clear the tracking status. */
@@ -3509,6 +3511,10 @@ int postWriteToClient(client *c) {
             connSetWriteHandler(c->conn, NULL);
         }
 
+        /* COB fully flushed: if this client was paused because its output buffer could not be
+         * flushed, resume it now (re-arm reads, reprocess pending input). */
+        if (isClientPausedOnPendingCOB(c)) resumeClientPausedOnPendingCOB(c);
+
         /* Close connection after entire reply has been sent. */
         if (c->flag.close_after_reply) {
             freeClientAsync(c);
@@ -3744,6 +3750,7 @@ void processClientIOWriteDone(client *c) {
         /* Install the write handler if there are pending writes in some of the clients as a result of not being
          * able to write everything in one go. */
         installClientWriteHandler(c);
+        pauseClientOnPendingCOB(c);
     } else {
         /* If we can send the client to the I/O thread, let it handle the write. */
         if (trySendWriteToIOThreads(c) == C_OK) return;
@@ -3797,6 +3804,7 @@ int handleClientsWithPendingWrites(void) {
          * output to the client, we need to install the writable handler. */
         if (clientHasPendingReplies(c)) {
             installClientWriteHandler(c);
+            pauseClientOnPendingCOB(c);
         }
     }
     return processed;
@@ -4666,7 +4674,7 @@ static void prefetchCommandQueueKeys(client *c) {
 }
 
 int processInputBuffer(client *c) {
-    monotime startTime = getMonotonicUs(); // AMZN
+    monotime startTime = getMonotonicUs();
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
@@ -4677,14 +4685,14 @@ int processInputBuffer(client *c) {
         c->read_flags = isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
 
-        /* BEGIN AMZN */
         if (!c->flag.replica && !c->flag.primary) {
-            if ((server.pipeline_deferral.execution_limit_ms > 0 && elapsedMs(startTime) >= server.pipeline_deferral.execution_limit_ms) || (server.pipeline_deferral.cob_limit_bytes > 0 && getClientOutputBufferMemoryUsage(c) > server.pipeline_deferral.cob_limit_bytes)) {
+            if ((server.pipeline_deferral.execution_limit_ms > 0 && elapsedMs(startTime) >= server.pipeline_deferral.execution_limit_ms) || 
+                (server.pipeline_deferral.cob_limit_bytes > 0 && getClientOutputBufferMemoryUsage(c) > server.pipeline_deferral.cob_limit_bytes)) {
                 deferPipelineClient(c);
                 break;
             }
         }
-        /* END AMZN */
+
         bool popped_from_queue;
         /* If commands are queued up, pop from the queue first */
         if (!consumeCommandQueue(c)) {
@@ -7200,11 +7208,7 @@ void evictClients(void) {
     }
 }
 
-/* Pipeline timer event handler.
- * Remove one client from the head of the queue of deferred clients and resume processing its
- * input buffer. Note that we process one client per timer invocation so as to keep the event
- * loop spinning faster, thus improving the server's responsiveness and average latency.
- */
+/* Pipeline wakeup timer */
 static long long deferredPipelineTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
@@ -7212,46 +7216,36 @@ static long long deferredPipelineTimeProc(struct aeEventLoop *eventLoop, long lo
 
     if (listLength(server.pipeline_deferral.queue) == 0) {
         server.pipeline_deferral.timer_proc_active = false;
-        return AE_NOMORE; // turn off the timer event
+        return AE_NOMORE; // turn off the wakeup timer
     }
+    
+    resumeOneDeferredPipelineClient();
 
-    // Dequeue a client from the deferred pipeline queue
-    list *queue = server.pipeline_deferral.queue;
-    listNode *ln = listFirst(queue);
+    return 0;
+}
+
+void resumeOneDeferredPipelineClient(void) {
+    if (listLength(server.pipeline_deferral.queue) == 0) return;
+
+    listNode *ln = listFirst(server.pipeline_deferral.queue);
     client *c = listNodeValue(ln);
-    removePipelineDeferralClient(c);
-
-    // Process the remaining commands in the query buffer.
-    if (processInputBuffer(c) == C_ERR || c->flag.close_asap) return 0;
-
-    beforeNextClient(c);
-
-    // Re-register fd with the event loop for reading unless the client is blocked or deferred again.
-    if (IS_AMZ_CLIENT_BLOCKED(c)) return 0;
-
-    if (c->conn && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
-        freeClient(c);
-    }
-
-    return 0; // continue processing remaining deferred clients
+    unblockClient(c, 1);
 }
 
 /* When a slow-running pipelined command is detected, we call this function to defer processing
- * of the remaining commands. First, push the client into a queue. Then, unregister it from the
- * event loop for reading. Finally, create a timer event (if not created yet) that will continue
- * to process the client later. */
+ * of the remaining commands */
 static inline void deferPipelineClient(client *c) {
-    serverAssert(!c->flag.deferred);
+    serverAssert(!c->flag.blocked);
 
-    // enqueue: add to the tail
+    blockClient(c, BLOCKED_DEFER);
+
+    /* enqueue: add to the tail; remember the node in the blocking state's generic list node. */
     list *queue = server.pipeline_deferral.queue;
     listAddNodeTail(queue, c);
-    c->flag.deferred = 1;
-    c->pipeline_deferral_node = listLast(queue);
-    server.pipeline_deferral.total_deferrals++; // total_deferrals is never decremented
+    c->bstate->generic_blocked_list_node = listLast(queue); /* cached for O(1) removal later */
+    server.pipeline_deferral.total_deferrals++;
 
-    // Unregister fd from the event loop for reading. Without doing so, file events may be fired again
-    // to fetch next 16KB of query, while we are not done with processing the current query buffer.
+    // Pause reading new commands for this client.
     connSetReadHandler(c->conn, NULL);
 
     if (!server.pipeline_deferral.timer_proc_active) {
@@ -7260,12 +7254,47 @@ static inline void deferPipelineClient(client *c) {
     }
 }
 
+/* Remove a client from the deferral queue. Called from unblockClient()'s BLOCKED_DEFER case
+ * and from unlinkClient() (so a client freed while deferred leaves no dangling queue node).
+ * This only touches the queue/node; the blocking-state teardown is done by unblockClient(). */
 static inline void removePipelineDeferralClient(client *c) {
-    if (!c->flag.deferred) return;
+    if (!isPipelineDeferralClient(c)) return;
 
-    listDelNode(server.pipeline_deferral.queue, c->pipeline_deferral_node);
-    c->flag.deferred = 0;
-    c->pipeline_deferral_node = NULL;
+    if (c->bstate->generic_blocked_list_node) {
+        listDelNode(server.pipeline_deferral.queue, c->bstate->generic_blocked_list_node);
+        c->bstate->generic_blocked_list_node = NULL;
+    }
+}
+
+/* Pause-on-pending-COB */
+void pauseClientOnPendingCOB(client *c) {
+    if (server.pause_clients_on_pending_cob == 0) return;
+
+    if (!c->conn || getClientType(c) != CLIENT_TYPE_NORMAL) return;
+
+    if (c->flag.blocked) {
+        if (c->bstate->btype == BLOCKED_DEFER) {
+            /* clears BLOCKED_DEFER (dequeues), no reprocessing */
+            unblockClient(c, 0); 
+        } else {
+            /* If blocked on any other type (including COB), we do not block again. */
+            return;
+        }
+    }
+    /* An unblocked-but-not-yet-reprocessed client is owned by processUnblockedClients(); blockClient()
+     * doesn't guard against flag.unblocked, so skip it here to avoid double-driving its pending command. */
+    if (c->flag.unblocked) return;
+
+    blockClient(c, BLOCKED_COB_PAUSE);
+    server.total_cob_pauses++;
+    connSetReadHandler(c->conn, NULL);
+}
+
+/* Release a client that was paused on pending COB */
+void resumeClientPausedOnPendingCOB(client *c) {
+    if (c->flag.blocked && c->bstate->btype == BLOCKED_COB_PAUSE) {
+        unblockClient(c, 1);
+    }
 }
 /* IO threads functions */
 

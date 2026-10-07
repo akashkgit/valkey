@@ -242,13 +242,32 @@ void unblockClient(client *c, int queue_for_reprocessing) {
     case BLOCKED_INUSE:
         unlinkBlockInUseClient(c);
         break;
+    case BLOCKED_DEFER:
+        /* Remove from the pipeline deferral queue (node stored in the generic list node). */
+        if (c->bstate->generic_blocked_list_node) {
+            listDelNode(server.pipeline_deferral.queue, c->bstate->generic_blocked_list_node);
+            c->bstate->generic_blocked_list_node = NULL;
+        }
+        break;
+    case BLOCKED_COB_PAUSE:
+        /* No container to clean up: a COB-paused client is released reactively by the write
+         * path the moment its own socket drains, so it is not enqueued anywhere. */
+        break;
     default:
         serverPanic("Unknown btype in unblockClient().");
     }
 
     /* Reset the client for a new query, unless the client has pending command to process
-     * or in case a shutdown operation was canceled and we are still in the processCommand sequence  */
-    if (!c->flag.pending_command && c->bstate->btype != BLOCKED_SHUTDOWN) {
+     * or in case a shutdown operation was canceled and we are still in the processCommand sequence.
+     *
+     * BLOCKED_DEFER and BLOCKED_COB_PAUSE are also excluded: these throttling states suspend a
+     * client with partially-parsed input still in its query buffer (mid-pipeline for DEFER,
+     * possibly mid-parse of the next command for COB-pause). They resume by CONTINUING to parse
+     * that buffer (processInputBuffer), not by restarting a command, so calling resetClient here
+     * would wipe argv/per-command parse state while multibulklen/bulklen/qb_pos still reference
+     * the buffered-but-unparsed bytes, corrupting the next parse. */
+    if (!c->flag.pending_command && c->bstate->btype != BLOCKED_SHUTDOWN &&
+        c->bstate->btype != BLOCKED_DEFER && c->bstate->btype != BLOCKED_COB_PAUSE) {
         /* Clients that are not blocked on keys are not reprocessed so we must
          * call reqresAppendResponse here (for clients blocked on key,
          * unblockClientOnKey is called, which eventually calls processCommand,

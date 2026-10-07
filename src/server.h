@@ -363,6 +363,8 @@ typedef enum blocking_type {
     BLOCKED_POSTPONE, /* Blocked by processCommand, re-try processing later. */
     BLOCKED_SHUTDOWN, /* SHUTDOWN. */
     BLOCKED_INUSE,    /* Key in use by background thread. */
+    BLOCKED_DEFER,    /* Blocked for overcoming execution or cob limits */
+    BLOCKED_COB_PAUSE, /* Reads paused because the client-output-buffer could not be flushed */
     BLOCKED_NUM,      /* Number of blocked states. */
     BLOCKED_END       /* End of enumeration */
 } blocking_type;
@@ -1063,17 +1065,14 @@ typedef struct blockingState {
 
 /* Structure to track pipeline deferrals */
 typedef struct {
-    /* Execution time limit of pipelined commands above which Redis will defer processing
-     * the current client and move onto the next one. */
     unsigned int execution_limit_ms;
-
-    /* Client output bytes limit above which the pipelined client's processing will be deferred */
     unsigned int cob_limit_bytes;
-
-    list *queue;                        // Queue of deferred pipeline clients
+    list *queue;                        // Queue of deferred pipeline clients (BLOCKED_DEFER)
     unsigned long long total_deferrals; // Total number of times pipeline clients are deferred.
                                         // This value is never decremented.
-    bool timer_proc_active;
+    bool timer_proc_active;             // A wakeup timer is scheduled. Deviation: the timer only
+                                        // keeps the event loop turning so blockedBeforeSleep runs;
+                                        // it does NOT itself resume/execute deferred clients.
 } pipelineDeferral;
 
 /* The following structure represents a node in the server.ready_keys list,
@@ -1210,7 +1209,6 @@ typedef struct ClientFlags {
     uint64_t monitor : 1;                  /* This client is a replica monitor, see MONITOR */
     uint64_t multi : 1;                    /* This client is in a MULTI context */
     uint64_t blocked : 1;                  /* The client is waiting in a blocking operation */
-    uint64_t deferred : 1;                 /* The client is deferred due to exceeding pipelined execution limits */
     uint64_t dirty_cas : 1;                /* Watched keys modified. EXEC will fail. */
     uint64_t close_after_reply : 1;        /* Close after writing entire reply. */
     uint64_t unblocked : 1;                /* This client was unblocked and is stored in server.unblocked_clients */
@@ -1523,7 +1521,6 @@ typedef struct client {
     list *deferred_reply;                    /* List of reply objects to be sent to the client, typically after
                                                 the client has been unblocked. */
     unsigned long long deferred_reply_bytes; /* Total bytes of objects in the blocked client pending list.*/
-    listNode *pipeline_deferral_node;        /* Stores reference to the list node in the pipeline deferral queue for the current client */
     /* Throttling */
     struct throttler *throttler;       /* Current throttler this client is queued in, or NULL */
     listNode *throttle_node;           /* Node in throttler's client_queue */
@@ -2102,12 +2099,14 @@ struct valkeyServer {
     durationStats duration_stats[EL_DURATION_TYPE_NUM];
 
     pipelineDeferral pipeline_deferral; /* Tracks deferrals of client's pipelined commands */
+    unsigned long long total_cob_pauses; /* Lifetime count of clients paused on pending COB. Never decremented. */
 
     /* Configuration */
     int verbosity;               /* Loglevel verbosity */
     int hide_user_data_from_log; /* Hide or redact user data, or data that may contain user data, from the log. */
     int maxidletime;             /* Client timeout in seconds */
     int tcpkeepalive;            /* Set SO_KEEPALIVE if non-zero. */
+    int pause_clients_on_pending_cob; /* Pause a client instead of letting its COB grow (BLOCKED_COB_PAUSE). */
     int active_expire_enabled;   /* Can be disabled for testing purposes. */
     int active_expire_effort;    /* From 1 (default) to 10, active effort. */
     int lazy_expire_disabled;    /* If > 0, don't trigger lazy expire */
@@ -3104,20 +3103,11 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
 
-/* Returns true if the client has been deferred due to exceeding pipelined execution limits. */
-#define isPipelineDeferralClient(c) ((c)->flag.deferred)
+/* True if the client is blocked in the pipeline-deferral throttling state (BLOCKED_DEFER). */
+#define isPipelineDeferralClient(c) ((c)->flag.blocked && (c)->bstate && (c)->bstate->btype == BLOCKED_DEFER)
+/* True if the client is paused because its client-output-buffer could not be flushed (BLOCKED_COB_PAUSE). */
+#define isClientPausedOnPendingCOB(c) ((c)->flag.blocked && (c)->bstate && (c)->bstate->btype == BLOCKED_COB_PAUSE)
 
-/* Returns true if the client is in any state that should suspend normal read processing.
- *
- * NOTE: This macro currently only accounts for pipeline-deferred clients. The AMZ
- * (ElastiCacheRedis) variant additionally OR's in several other "blocked" states that do
- * not yet exist in valkey and still need to be filled in once those subsystems are ported:
- *   || isAmzBlockedClient(c)
- *   || isAmzRateThrottledClient(c)
- *   || isAmzTSPendingProcessingReplicationClient(c)
- *   || isAmzClientPausedOnPendingCOB(c)
- */
-#define IS_AMZ_CLIENT_BLOCKED(c) (isPipelineDeferralClient(c))
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
 #define WRITE_FLAGS_IS_REPLICA (1 << 1)
@@ -4156,6 +4146,7 @@ int isInsideYieldingLongCommand(void);
 
 /* Blocked clients API */
 void processUnblockedClients(void);
+void resumeOneDeferredPipelineClient(void);
 void initClientBlockingState(client *c);
 void freeClientBlockingState(client *c);
 void resetBlockedClientPendingReply(client *c);

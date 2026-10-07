@@ -3495,6 +3495,7 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
+    createBoolConfig("pause-clients-on-pending-cob", NULL, MODIFIABLE_CONFIG, server.pause_clients_on_pending_cob, 0, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
@@ -3622,8 +3623,8 @@ standardConfig static_configs[] = {
     createUIntConfig("socket-mark-id", NULL, IMMUTABLE_CONFIG, 0, UINT_MAX, server.socket_mark_id, 0, INTEGER_CONFIG, NULL, NULL),
     createUIntConfig("max-new-connections-per-cycle", NULL, MODIFIABLE_CONFIG, 1, 1000, server.max_new_conns_per_cycle, 10, INTEGER_CONFIG, NULL, NULL),
     createUIntConfig("max-new-tls-connections-per-cycle", NULL, MODIFIABLE_CONFIG, 1, 1000, server.max_new_tls_conns_per_cycle, 1, INTEGER_CONFIG, NULL, NULL),
-    createUIntConfig("pipeline-commands-time-limit-ms", NULL, MODIFIABLE_CONFIG, 0, 1000, server.pipeline_deferral.execution_limit_ms, 20, INTEGER_CONFIG, NULL, NULL), /* Execution time limit of pipelined commands for deferral */
-    createUIntConfig("pipeline-commands-cob-limit-bytes", NULL, MODIFIABLE_CONFIG, 0, UINT_MAX, server.pipeline_deferral.cob_limit_bytes, 0, INTEGER_CONFIG, NULL, NULL), /* Client output bytes limit of pipelined commands for deferral */
+    createUIntConfig("pipelined-commands-time-limit-ms", NULL, MODIFIABLE_CONFIG, 0, 1000, server.pipeline_deferral.execution_limit_ms, 20, INTEGER_CONFIG, NULL, NULL),
+    createUIntConfig("pipelined-commands-cob-limit-bytes", NULL, MODIFIABLE_CONFIG, 0, UINT_MAX, server.pipeline_deferral.cob_limit_bytes, 0, INTEGER_CONFIG, NULL, NULL),
 #ifdef LOG_REQ_RES
     createUIntConfig("client-default-resp", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 2, 3, server.client_default_resp, 2, INTEGER_CONFIG, NULL, NULL),
 #endif

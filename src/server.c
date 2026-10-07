@@ -2540,6 +2540,8 @@ void initServerConfig(void) {
     server.pipeline_deferral.queue = listCreate();
     // Initialize pipeline deferral metric
     server.pipeline_deferral.total_deferrals = 0;
+    // Initialize pause-on-pending-COB metric
+    server.total_cob_pauses = 0;
 
 
     /* Linux OOM Score config */
@@ -6615,7 +6617,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "maxclients:%u\r\n", server.maxclients,
                 "client_recent_max_input_buffer:%zu\r\n", maxin,
                 "client_recent_max_output_buffer:%zu\r\n", maxout,
-                "blocked_clients:%d\r\n", server.blocked_clients,
+                "blocked_clients:%d\r\n", server.blocked_clients - (int)server.blocked_clients_by_type[BLOCKED_DEFER] - (int)server.blocked_clients_by_type[BLOCKED_COB_PAUSE],
                 "tracking_clients:%d\r\n", server.tracking_clients,
                 "pubsub_clients:%d\r\n", server.pubsub_clients,
                 "watching_clients:%d\r\n", server.watching_clients,
@@ -6925,7 +6927,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_priority_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
                 "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum, 
                 "amz_current_num_pipeline_deferral_clients:%lu\r\n", listLength(server.pipeline_deferral.queue),
-                "amz_total_pipeline_deferral_lifetime:%llu\r\n", server.pipeline_deferral.total_deferrals));
+                "amz_total_pipeline_deferral_lifetime:%llu\r\n", server.pipeline_deferral.total_deferrals,
+                "amz_current_num_clients_paused_on_pending_cob:%u\r\n", server.blocked_clients_by_type[BLOCKED_COB_PAUSE],
+                "amz_total_clients_paused_on_pending_cob_lifetime:%llu\r\n", server.total_cob_pauses));
         info = genValkeyInfoStringACLStats(info);
     }
 
