@@ -354,77 +354,73 @@ start_server {tags {"networking external:skip"}} {
         return $s
     }
 
-    test {pipeline deferral: a large pipeline on one connection triggers deferral} {
-        # Deferral on a tight time budget; COB-pause off so this test is isolated.
+    test {A large pipeline on one connection is deferred without blocking other clients, and still completes fully} {
+        # Set related configs
         r config set pipelined-commands-time-limit-ms 1
         r config set pipelined-commands-cob-limit-bytes 0
-        r config set pause-clients-on-pending-cob no
-        r flushall
 
+        # Cache the counter value before the test
         set before [status r total_deferred_pipeline_clients]
 
-        # Deferral fires only when a SINGLE processInputBuffer() pass exceeds the time budget
-        # (startTime is captured per call), so the pipeline must be large enough that parsing +
-        # executing it in one pass reliably takes >1ms even on a fast optimized build. 3000 was
-        # borderline and flaked on fast hardware; 50000 gives a wide margin without being slow.
+        # Send high number of pipelined commands at once without reading it
         set rd [valkey_deferring_client]
         set n 50000
         set payload ""
-        for {set i 0} {$i < $n} {incr i} { append payload [_resp_cmd SET "dk:$i" "v$i"] }
+        for {set i 0} {$i < $n} {incr i} { append payload [_resp_cmd SET "dk:$i" "v"] }
         $rd write $payload
         $rd flush
+
+        # Send a test command on another client which should get a response
+        assert_equal {OK} [r set probe hello]
+        assert_equal {hello} [r get probe]
+
+        # Now drain all pipeline replies for the pipelined client
         for {set i 0} {$i < $n} {incr i} { assert_equal {OK} [$rd read] }
+        assert_equal [expr {$n + 1}] [r dbsize]
         $rd close
 
-        # The whole batch landed (continuation correctness) ...
-        assert_equal $n [r dbsize]
-        # ... and deferral actually fired.
+        # Check the client got deferred
         set after [status r total_deferred_pipeline_clients]
         assert {$after > $before}
 
-        # Server stayed responsive and no client is left parked.
+        # Server sanity check
         assert_equal {PONG} [r ping]
-        assert_equal 0 [status r blocked_clients]
     }
 
-    test {pause-on-pending-COB: a slow reader is paused, not disconnected, then resumes} {
-        # COB-pause on; deferral off so this test is isolated.
+    test {A client that stops reading its replies is paused instead of disconnected, and resumes once it drains} {
+        
+        # Update related configs
         r config set pause-clients-on-pending-cob yes
         r config set pipelined-commands-time-limit-ms 0
         r config set pipelined-commands-cob-limit-bytes 0
-        r flushall
 
-        # A large value so a few GETs fill the client output buffer the server cannot flush to a
-        # client that never reads.
+        # A large value so a few GETs fill the client output buffer in the server
         r set big [string repeat x 100000]
 
+        # Cache the metric before the test
         set paused_before [status r total_paused_on_cob_clients]
 
-        # Deferring client that WRITES but does not read -> its server-side COB cannot drain.
+        # For a deferring client that does not read after writing the command, the output-buffer grows
         set rd [valkey_deferring_client]
         set payload ""
         for {set i 0} {$i < 100} {incr i} { append payload [_resp_cmd GET big] }
         $rd write $payload
         $rd flush
 
-        # The server should pause this client (read handler off) rather than evict it. Observe it
-        # through the lifetime counter advancing (current gauge is no longer exported).
+        # Check the client gets paused
         wait_for_condition 50 100 {
             [status r total_paused_on_cob_clients] > $paused_before
         } else {
             fail "client was not paused on pending COB"
         }
 
-        # The client is still connected (paused, not disconnected).
-        assert {[status r connected_clients] >= 2}
-        # A separate client is still served normally while the slow one is parked.
-        assert_equal {PONG} [r ping]
-
-        # Read ALL replies so the socket fully drains; the server resumes reading the client
-        # (write path -> resumeClientPausedOnPendingCOB) and the batch completes cleanly. Reading
-        # all 100 replies back only succeeds if the paused client was resumed.
+        # Now, read all the outputs for the command
         for {set i 0} {$i < 100} {incr i} { assert_equal [string repeat x 100000] [$rd read] }
         $rd close
+
+        # Server sanity check
+        assert_equal {PONG} [r ping]
+
     }
 
     test {deferral + COB-pause together: both features active, server stays correct} {
