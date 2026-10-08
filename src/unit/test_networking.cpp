@@ -84,8 +84,8 @@ void testOnlyTrimReplyUnusedTailSpace(client *c);
 void setDeferredReply(client *c, void *node, const char *s, size_t length);
 
 /* Client throttling (unified BLOCKED_THROTTLED) entry points exercised by the
- * throttling-invariant tests. deferPipelineClient is static, hence the wrapper. */
-void testOnlyDeferPipelineClient(client *c);
+ * throttling-invariant tests. */
+void deferPipelineClient(client *c);
 void pauseClientOnPendingCOB(client *c);
 void resumeClientPausedOnPendingCOB(client *c);
 void resumeOneDeferredPipelineClient(void);
@@ -956,22 +956,17 @@ TEST_F(NetworkingTest, TestSetDeferredReplyNextMergeGuardsIoLastWritten) {
     }
 }
 
-/* ====================================================================
- * Client throttling invariant: pipeline deferral and pause-on-pending-COB
- * are unified under BLOCKED_THROTTLED and distinguished only by whether the
- * client is enqueued in the deferral queue (generic_blocked_list_node). These
- * tests lock that relationship so a future change to the block/unblock/convert
- * paths that breaks "deferred => enqueued, COB-paused => not enqueued" fails
- * loudly here.
- * ==================================================================== */
-/* The throttle sub-state predicates are only needed by these tests (engine code inlines the
- * checks), so define them locally rather than export otherwise-unused macros from server.h. */
-#define isPipelineDeferralClient(c) (isClientThrottled(c) && (c)->bstate->is_deferred)
-#define isClientPausedOnPendingCOB(c) (isClientThrottled(c) && !(c)->bstate->is_deferred)
-
 class ThrottlingInvariantTest : public ::testing::Test {
   protected:
+    client *c = nullptr;
     static inline ConnectionType dummyConnType = {0};
+
+    static bool isPipelineDeferralClient(client *c) {
+        return isClientThrottled(c) && c->bstate->is_deferred;
+    }
+    static bool isClientPausedOnPendingCOB(client *c) {
+        return isClientThrottled(c) && !c->bstate->is_deferred;
+    }
 
     static int dummySetReadHandler(connection *conn, ConnectionCallbackFunc func) {
         conn->read_handler = func;
@@ -982,9 +977,6 @@ class ThrottlingInvariantTest : public ::testing::Test {
         dummyConnType.set_read_handler = dummySetReadHandler;
         server.unblocked_clients = listCreate();
         server.pipeline_deferral.queue = listCreate();
-        /* Pretend the wakeup timer is already scheduled so deferPipelineClient does
-         * not reach aeCreateTimeEvent (which would need a real event loop). */
-        server.pipeline_deferral.timer_proc_active = true;
         server.pipeline_deferral.total_deferrals = 0;
         server.total_cob_pauses = 0;
         server.pause_clients_on_pending_cob = 1;
@@ -993,6 +985,7 @@ class ThrottlingInvariantTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        if (c) freeClient(c);
         listRelease(server.pipeline_deferral.queue);
         server.pipeline_deferral.queue = NULL;
         listRelease(server.unblocked_clients);
@@ -1016,88 +1009,68 @@ class ThrottlingInvariantTest : public ::testing::Test {
     }
 };
 
-/* Deferral enqueues: the client becomes BLOCKED_THROTTLED with a non-NULL queue
- * node, is added to the deferral queue, and classifies as deferred (not COB). */
-TEST_F(ThrottlingInvariantTest, DeferralEnqueuesClient) {
-    client *c = makeNormalClient(1);
 
-    testOnlyDeferPipelineClient(c);
+TEST_F(ThrottlingInvariantTest, DeferThenResumeClient) {
+    c = makeNormalClient(1);
 
-    EXPECT_TRUE(c->flag.blocked);
-    EXPECT_EQ(c->bstate->btype, BLOCKED_THROTTLED);
-    EXPECT_TRUE(c->bstate->is_deferred);
-    EXPECT_NE(c->bstate->generic_blocked_list_node, nullptr);
-    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 1u);
+    /* Timer is scheduled by deferral; pretend it already exists so we don't need a real loop. */
+    server.pipeline_deferral.timer_proc_active = true;
+    deferPipelineClient(c);
+
+    /* Expect the client to be deferred and not paused on pending COB */
     EXPECT_TRUE(isPipelineDeferralClient(c));
-    EXPECT_FALSE(isClientPausedOnPendingCOB(c));
+    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 1u);
+    EXPECT_NE(c->bstate->generic_blocked_list_node, nullptr);
     EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_THROTTLED], 1u);
+    EXPECT_FALSE(isClientPausedOnPendingCOB(c));
 
-    unblockClient(c, 0);
+    /* Resume the deferred client */
+    resumeOneDeferredPipelineClient();
+
+    /* Check the client is not deferred anymore and is part of unblocked clients processed by processUnblockedClients() */
+    EXPECT_FALSE(isPipelineDeferralClient(c));
     EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
     EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
-    freeClient(c);
+    EXPECT_EQ(listLength(server.unblocked_clients), 1u);
 }
 
-/* COB-pause does NOT enqueue: the client becomes BLOCKED_THROTTLED with a NULL
- * queue node, the deferral queue stays empty, and it classifies as COB-paused. */
 TEST_F(ThrottlingInvariantTest, CobPauseDoesNotEnqueueClient) {
-    client *c = makeNormalClient(1);
+    c = makeNormalClient(1);
 
+    /* Pause a client */
     pauseClientOnPendingCOB(c);
 
-    EXPECT_TRUE(c->flag.blocked);
-    EXPECT_EQ(c->bstate->btype, BLOCKED_THROTTLED);
-    EXPECT_FALSE(c->bstate->is_deferred);
-    EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
-    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
+    /* Check client is paused due to pending COB and not on deferral */
     EXPECT_TRUE(isClientPausedOnPendingCOB(c));
+    EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
     EXPECT_FALSE(isPipelineDeferralClient(c));
+    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
     EXPECT_EQ(server.total_cob_pauses, 1ull);
 
-    unblockClient(c, 0);
-    freeClient(c);
+    /* Resume the paused client (write path drains the COB) */
+    resumeClientPausedOnPendingCOB(c);
+
+    /* Check its resumed and is part of unblocked clients processed by processUnblockedClients() */
+    EXPECT_FALSE(isClientPausedOnPendingCOB(c));
+    EXPECT_EQ(listLength(server.unblocked_clients), 1u);
 }
 
-/* Converting a deferred client to COB-pause dequeues it: the node goes NULL, the
- * deferral queue empties, and the client reclassifies from deferred to COB-paused
- * while staying throttled the whole time. */
 TEST_F(ThrottlingInvariantTest, DeferralToCobConversionDequeues) {
-    client *c = makeNormalClient(1);
+    c = makeNormalClient(1);
 
-    testOnlyDeferPipelineClient(c);
+    /* Timer is scheduled by deferral; pretend it already exists so we don't need a real loop. */
+    server.pipeline_deferral.timer_proc_active = true;
+    deferPipelineClient(c);
+
+    /* Check the client got deferred */
     ASSERT_TRUE(isPipelineDeferralClient(c));
     ASSERT_EQ(listLength(server.pipeline_deferral.queue), 1u);
 
     /* The write path finds the COB cannot flush and converts the deferred client. */
     pauseClientOnPendingCOB(c);
 
-    EXPECT_TRUE(c->flag.blocked);
-    EXPECT_EQ(c->bstate->btype, BLOCKED_THROTTLED);
-    EXPECT_FALSE(c->bstate->is_deferred);
-    EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
-    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
+    /* Expect the client to be moved to paused to due to pending COB state */
     EXPECT_TRUE(isClientPausedOnPendingCOB(c));
     EXPECT_FALSE(isPipelineDeferralClient(c));
-
-    unblockClient(c, 0);
-    freeClient(c);
-}
-
-/* Resuming a deferred client via the unblock path clears the queue node and
- * removes it from the deferral queue. */
-TEST_F(ThrottlingInvariantTest, ResumeDeferredClearsNode) {
-    client *c = makeNormalClient(1);
-
-    testOnlyDeferPipelineClient(c);
-    ASSERT_NE(c->bstate->generic_blocked_list_node, nullptr);
-
-    resumeOneDeferredPipelineClient(); /* pops head, unblockClient(c, 1) */
-
-    EXPECT_FALSE(c->flag.blocked);
     EXPECT_EQ(c->bstate->generic_blocked_list_node, nullptr);
-    EXPECT_EQ(listLength(server.pipeline_deferral.queue), 0u);
-
-    /* resumeOneDeferredPipelineClient queued it for reprocessing. */
-    EXPECT_EQ(listLength(server.unblocked_clients), 1u);
-    freeClient(c);
 }

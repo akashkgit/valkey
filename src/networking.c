@@ -144,7 +144,7 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c);
 int postponeClientRead(client *c);
 char *getClientSockname(client *c);
 static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter);
-static inline void deferPipelineClient(client *c);
+void deferPipelineClient(client *c);
 static inline int removePipelineDeferralClient(client *c);
 void pauseClientOnPendingCOB(client *c);
 void resumeClientPausedOnPendingCOB(client *c);
@@ -7230,7 +7230,7 @@ void resumeOneDeferredPipelineClient(void) {
 
 /* When a slow-running pipelined command is detected, we call this function to defer processing
  * of the remaining commands */
-static inline void deferPipelineClient(client *c) {
+void deferPipelineClient(client *c) {
     serverAssert(!c->flag.blocked);
 
     /* Block the client and stop listening for new read events for this client */
@@ -7432,8 +7432,4 @@ void testOnlySaveLastWrittenBuf(client *c, bufWriteMetadata *metadata, int bufcn
 
 void testOnlyTrimReplyUnusedTailSpace(client *c) {
     trimReplyUnusedTailSpace(c);
-}
-
-void testOnlyDeferPipelineClient(client *c) {
-    deferPipelineClient(c);
 }
