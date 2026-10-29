@@ -334,7 +334,7 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
     }
 }
 
-start_server {tags {"networking external:skip"}} {
+start_server {tags {"network external:skip"}} {
 
     # Sends n * 5ms sleep commands at once without reading the response
     proc run_slow_pipeline {rd n} {
@@ -344,13 +344,13 @@ start_server {tags {"networking external:skip"}} {
         $rd flush
     }
 
-    # Lifetime deferral count before
+    # Lifetime deferral count before the tests
     set deferrals_before [status r total_deferred_pipeline_clients]
 
     test {Slow pipeline commands without time limit starve other clients} {
 
         # Disable deferral
-        r config set pipelined-commands-time-limit 0
+        r config set pipelined-limit-us 0
 
         # set a sample key
         r set test.key1 1 ;
@@ -359,7 +359,14 @@ start_server {tags {"networking external:skip"}} {
         # can hold ~443 copies. So, 500 copies starves other clients for at least ~2.5s, spiking their latency
         set rd [valkey_deferring_client]
         set n 500
+
+        # Pause the server so the pipeline is queued before the main or I/O thread reads it.
+        pause_process [srv 0 pid]
         run_slow_pipeline $rd $n
+        resume_process [srv 0 pid]
+
+        # Give the pipeline time to enter command execution before issuing the competing request.
+        after 50
 
         # Another concurrent client waits behind the whole pipeline, so it exceeds 2000ms.
         set has_high_latency 0
@@ -385,13 +392,20 @@ start_server {tags {"networking external:skip"}} {
     test {Slow pipeline commands with time limit are deferred} {
 
         # Set time-limit to defer the client after >7ms is spent in one pass
-        r config set pipelined-commands-time-limit 7
+        r config set pipelined-limit-us 7000
 
         # Send long running pipelined commands like before that would starve other clients
         # for at least 2.5s if pipeline deferral was disabled
         set rd [valkey_deferring_client]
         set n 500
+
+        # Pause the server so the pipeline is queued before the main or I/O thread reads it.
+        pause_process [srv 0 pid]
         run_slow_pipeline $rd $n
+        resume_process [srv 0 pid]
+
+        # Give the pipeline time to enter command execution before issuing competing requests.
+        after 50
 
         # Verify a concurrent client has reduced latency now
         set max_latency 0

@@ -159,11 +159,11 @@ static int parseMultibulk(client *c,
                           int *argv_len,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd);
-static inline void removeDeferredPipelineClient(client *c);
+static void removeDeferredPipelineClient(client *c);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
-static bool deferred_pipeline_timer_active = false;
+static bool isDeferredPipelineProcRunning = false;
 
 typedef enum {
     PARSE_OK = 0,
@@ -4567,7 +4567,7 @@ void discardCommandQueue(client *c) {
 }
 
 /* Removes a deferred client from the deferred pipeline clients queue, clearing its deferred state */
-static inline void removeDeferredPipelineClient(client *c) {
+static void removeDeferredPipelineClient(client *c) {
     if (!c->flag.pipeline_deferred) return;
 
     listDelNode(server.deferred_pipeline_clients, c->deferred_pipeline_node);
@@ -4585,28 +4585,18 @@ static long long deferredPipelineTimeProc(struct aeEventLoop *eventLoop, long lo
     UNUSED(clientData);
 
     if (listLength(server.deferred_pipeline_clients) == 0) {
-        deferred_pipeline_timer_active = false;
+        isDeferredPipelineProcRunning = false;
         /* Stop the timer when there are no deferred clients left */
         return AE_NOMORE;
     }
 
-    /* Dequeue the client at the head of the deferral queue */
+    /* Dequeue the client at the head of the deferral queue and queue it to be
+     * reprocessed in beforeSleep() where the read-handler will be re-installed */
     list *queue = server.deferred_pipeline_clients;
     listNode *ln = listFirst(queue);
     client *c = listNodeValue(ln);
     removeDeferredPipelineClient(c);
-
-    /* Restore the read handler before resuming input processing. Deferral, throttling, or another
-     * state entered during processing can remove it again if reads must remain suspended. */
-    if (c->conn && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
-        freeClient(c);
-        return 0;
-    }
-
-    /* Resume processing remaining commands in its query buffer. */
-    if (processInputBuffer(c) == C_ERR || c->flag.close_asap) return 0;
-
-    beforeNextClient(c);
+    queueClientForReprocessing(c);
 
     /* Keep the timer running to drain the rest of the queue. */
     return 0;
@@ -4614,7 +4604,7 @@ static long long deferredPipelineTimeProc(struct aeEventLoop *eventLoop, long lo
 
 /* Queues a client to be processed later via timer callback and pauses processing of its new read events
  * until it's removed from the deferred pipeline */
-static inline void deferPipelineClient(client *c) {
+static void deferPipelineClient(client *c) {
     serverAssert(!c->flag.pipeline_deferred);
 
     /* Enqueue at the tail and cache the node for O(1) removal. */
@@ -4628,8 +4618,8 @@ static inline void deferPipelineClient(client *c) {
      * current query buffer is not fully processed */
     connSetReadHandler(c->conn, NULL);
 
-    if (!deferred_pipeline_timer_active) {
-        deferred_pipeline_timer_active = true;
+    if (!isDeferredPipelineProcRunning) {
+        isDeferredPipelineProcRunning = true;
         aeCreateTimeEvent(server.el, 0, deferredPipelineTimeProc, NULL, NULL);
     }
 }
@@ -4744,7 +4734,8 @@ int processInputBuffer(client *c) {
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
 
         if (getClientType(c) == CLIENT_TYPE_NORMAL) {
-            if (server.pipeline_cmds_time_limit_ms > 0 && elapsedMs(startTime) >= server.pipeline_cmds_time_limit_ms) {
+            if (server.pipelined_limit_us > 0 &&
+                elapsedUs(startTime) >= server.pipelined_limit_us) {
                 deferPipelineClient(c);
                 break;
             }
