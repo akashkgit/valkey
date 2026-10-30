@@ -159,7 +159,6 @@ static int parseMultibulk(client *c,
                           int *argv_len,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd);
-static void removeDeferredPipelineClient(client *c);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
@@ -2194,6 +2193,15 @@ void disconnectReplicas(void) {
         replica->flag.protected_rdb_channel = 0;
         freeClient(replica);
     }
+}
+
+/* Removes a deferred client from the deferred pipeline clients queue, clearing its deferred state */
+static void removeDeferredPipelineClient(client *c) {
+    if (!c->flag.pipeline_deferred) return;
+
+    listDelNode(server.deferred_pipeline_clients, c->deferred_pipeline_node);
+    c->flag.pipeline_deferred = 0;
+    c->deferred_pipeline_node = NULL;
 }
 
 /* Remove the specified client from global lists where the client could
@@ -4564,15 +4572,6 @@ void discardCommandQueue(client *c) {
     zfree(queue->cmds);
     queue->cmds = NULL;
     queue->off = queue->len = queue->cap = 0;
-}
-
-/* Removes a deferred client from the deferred pipeline clients queue, clearing its deferred state */
-static void removeDeferredPipelineClient(client *c) {
-    if (!c->flag.pipeline_deferred) return;
-
-    listDelNode(server.deferred_pipeline_clients, c->deferred_pipeline_node);
-    c->flag.pipeline_deferred = 0;
-    c->deferred_pipeline_node = NULL;
 }
 
 /* Deferred pipeline resume timer that dequeues a client from deferred-pipeline clients and
