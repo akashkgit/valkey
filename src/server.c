@@ -5333,6 +5333,9 @@ int finishShutdown(void) {
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
 
+    /* To prevent valgrind leak errors, stop the IO threads to free per-thread resources */
+    killIOThreads();
+
     moduleUnloadAllModules();
 
     /* Module unloading may drain IO queues, so stop workers afterward. */
